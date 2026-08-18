@@ -67,6 +67,13 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     public static let liveReloadNeverReady = PlaybackErrorKind(rawValue: "liveReloadNeverReady")
     /// An audio-track switch failed; the session it replaced is gone with it.
     public static let audioTrackSwitchFailed = PlaybackErrorKind(rawValue: "audioTrackSwitchFailed")
+    /// A source whose audio has to be transcoded (MP3, MP2, DTS, TrueHD, Vorbis, PCM: anything not
+    /// legal for stream-copy into fMP4) produced no encoded audio at all, so the mp4 muxer could not
+    /// build the sample entry it can only derive from a written packet and the first segment cut
+    /// failed (AE#396). Distinct from `vodSourceFailed`, which this used to arrive as: the source is
+    /// neither gone nor unreadable, and a second player that decodes the track itself will play it.
+    /// A host with a fallback ladder should DEMOTE on this one, not end the ladder.
+    public static let audioBridgeProducedNoOutput = PlaybackErrorKind(rawValue: "audioBridgeProducedNoOutput")
 }
 
 /// Machine-readable companion to the text inside `PlaybackState.error` (#376).

@@ -413,6 +413,81 @@ final class AudioBridge: @unchecked Sendable {
     /// on the pump thread; read lock-free for diagnostics, mirroring `liveBytes`.
     private(set) var outputBytesLifetime: Int64 = 0
 
+    /// AE#396: what the bridge has actually done with what it was handed.
+    ///
+    /// Every step between a source packet and an encoded frame can fail per packet, and each of those
+    /// arms ends in a `return` or in a loop that stops on a negative code: a packet the decoder
+    /// rejects, a decoder that answers nothing, a resample that converts to zero samples, an encoder
+    /// that keeps its output. Per packet that is the right behaviour, one bad frame must not end a
+    /// session. In aggregate it is the worst failure this class has, because a bridge that emits
+    /// NOTHING for a whole first segment surfaces as movenc's -22: the mp4 muxer is asked for an
+    /// AC-3/E-AC-3 sample entry it can only build from a packet that was never written, the cut
+    /// fails, the revive re-reads the same bytes twice more, and the session ends on "Source audio
+    /// cannot be muxed". Neither that sentence nor any line before it mentions audio decoding, so the
+    /// only subsystem that is definitely innocent is the one everybody reads about.
+    ///
+    /// These counters exist to name the arm. Written under `opLock` on the pump thread, read
+    /// lock-free for diagnostics, exactly like `outputBytesLifetime`.
+    struct FeedStats: Sendable, Equatable {
+        var packetsFed = 0
+        /// Source packets `avcodec_send_packet` rejected and `feed` skipped (`invalidData`, `einval`).
+        var packetsRejected = 0
+        var framesDecoded = 0
+        /// `avcodec_receive_frame` answers that were neither a frame nor EAGAIN/EOF.
+        var decodeErrors = 0
+        var lastDecodeErrorCode: Int32 = 0
+        /// Decoded frames that never reached the FIFO: no samples, a null plane, or a resample that
+        /// produced nothing.
+        var framesDroppedBeforeFIFO = 0
+        var samplesEnqueued: Int64 = 0
+        var packetsEmitted = 0
+        /// `avcodec_receive_packet` answers that were neither a packet nor EAGAIN/EOF.
+        var encodeErrors = 0
+        var lastEncodeErrorCode: Int32 = 0
+
+        /// Fed real source, answered with nothing at all.
+        var isSilent: Bool { packetsFed > 0 && packetsEmitted == 0 }
+
+        /// The DECODER is the arm that failed, which no rebuild can change: a producer restart opens a
+        /// fresh encoder (#99 failure mode B) but hands the same decoder the same bytes. That is the
+        /// line between a muxer revive that can heal and three attempts that read identically.
+        var decodedNothing: Bool { packetsFed > 0 && framesDecoded == 0 }
+
+        var summary: String {
+            var parts = ["fed=\(packetsFed)", "decoded=\(framesDecoded)",
+                         "enqueued=\(samplesEnqueued)", "emitted=\(packetsEmitted)"]
+            if packetsRejected > 0 { parts.append("rejected=\(packetsRejected)") }
+            if framesDroppedBeforeFIFO > 0 {
+                parts.append("droppedBeforeFIFO=\(framesDroppedBeforeFIFO)")
+            }
+            if decodeErrors > 0 {
+                parts.append("decodeErrors=\(decodeErrors)")
+                parts.append("lastDecodeError=\(FFmpegErr.text(for: lastDecodeErrorCode))")
+            } else if packetsRejected > 0, lastDecodeErrorCode != 0 {
+                parts.append("lastDecodeError=\(FFmpegErr.text(for: lastDecodeErrorCode))")
+            }
+            if encodeErrors > 0 {
+                parts.append("encodeErrors=\(encodeErrors)")
+                parts.append("lastEncodeError=\(FFmpegErr.text(for: lastEncodeErrorCode))")
+            }
+            return parts.joined(separator: " ")
+        }
+    }
+
+    private var stats = FeedStats()
+
+    /// Snapshot for the producer and the engine. The pump thread is the only writer, and both readers
+    /// run on it (the deferred-cut log site and the pump-finished handler).
+    var feedStats: FeedStats { stats }
+
+    /// One-shot: a bridge that stays silent for an hour costs one line, not one per packet.
+    private var silentFeedReported = false
+
+    /// Enough source that no start-up latency explains the silence. The largest encoder frame the
+    /// bridge builds is 1536 samples (E-AC-3) and the smallest source packet it is fed is 512 (DTS),
+    /// so three packets is the honest worst case before the first output and 64 is two orders past it.
+    private static let silentFeedPacketThreshold = 64
+
     /// Snapshot of bytes live in the bridge's growable buffers, for the engine memory probe. Both fields grow on
     /// the FFmpeg side (FIFO reallocs upward, swr delay buffer reallocates on rate/layout shift), so a
     /// monotonically rising value points here vs the segment muxer or HLS server. Costs: two C calls, no allocations.
@@ -641,6 +716,8 @@ final class AudioBridge: @unchecked Sendable {
             return []
         }
 
+        stats.packetsFed += 1
+
         var results: [UnsafeMutablePointer<AVPacket>] = []
 
         // Capture packet.pts for the encoder-PTS rebase, NOT the decoded frame's pts. Issue #7: for codecs with
@@ -658,7 +735,20 @@ final class AudioBridge: @unchecked Sendable {
         // Drain every decodable frame into the FIFO. The PTS rebase fires on the first frame after a segment
         // boundary so FLAC timestamps track the source rather than drifting on FIFO leftover (uses packetPts, not sf.pts).
         func receiveDecodedFrames() throws {
-            while avcodec_receive_frame(dec, sf) >= 0 {
+            while true {
+                // AE#396: the loop used to be `while avcodec_receive_frame(...) >= 0`, which reads
+                // "drain what is there" and behaves as "drop the reason there is nothing". A decoder
+                // that rejects every frame of a stream is then indistinguishable from one that has
+                // simply caught up, for the whole session.
+                let receiveRet = avcodec_receive_frame(dec, sf)
+                if receiveRet < 0 {
+                    if receiveRet != FFmpegErr.eagain, receiveRet != FFmpegErr.eof {
+                        stats.decodeErrors += 1
+                        stats.lastDecodeErrorCode = receiveRet
+                    }
+                    break
+                }
+                stats.framesDecoded += 1
                 if rebaseFromNextSourcePTS, packetPts != Self.avNoPTS {
                     nextEncoderPTS = av_rescale_q(packetPts, srcTimeBase, encoderTimeBase)
                     rebaseFromNextSourcePTS = false
@@ -676,6 +766,8 @@ final class AudioBridge: @unchecked Sendable {
                 sendRet = avcodec_send_packet(dec, pkt)
             }
             if sendRet == FFmpegErr.invalidData || sendRet == FFmpegErr.einval {
+                stats.packetsRejected += 1
+                stats.lastDecodeErrorCode = sendRet
                 // Skippable single-packet rejections, decoder stays usable for the next packet:
                 //   invalidData = corrupt source packet (glitchy live MPEG-TS, broken mp2 header);
                 //   einval (-22) = a DTS-HD MA XLL frame that residual-codes channels without a usable core
@@ -709,7 +801,26 @@ final class AudioBridge: @unchecked Sendable {
             throw error
         }
 
+        noteSilentFeedIfNeeded()
         return results
+    }
+
+    /// AE#396: say it once, the moment enough source has gone in for the silence to be structural
+    /// rather than start-up latency. Without this the only downstream evidence is movenc's -22 on a
+    /// moov it cannot build, which names the muxer and the source and never the bridge. `EngineLog`
+    /// has no error level, so the `ERROR:` prefix carries it, as in the #165 cascade line.
+    private func noteSilentFeedIfNeeded() {
+        guard !silentFeedReported,
+              stats.isSilent,
+              stats.packetsFed >= Self.silentFeedPacketThreshold else { return }
+        silentFeedReported = true
+        EngineLog.emit(
+            "[AudioBridge] ERROR: AE#396 the bridge has produced no encoded audio at all "
+            + "(mode=\(mode.rawValue)): \(stats.summary). The mp4 muxer can only build an "
+            + "AC-3/E-AC-3 sample entry from a packet that was written, so this session will fail "
+            + "its first segment cut unless output starts.",
+            category: .session
+        )
     }
 
     /// Align swr's INPUT side to the frame the decoder actually produced. libswresample reads `extended_data`
@@ -785,17 +896,26 @@ final class AudioBridge: @unchecked Sendable {
         // EXC_BAD_ACCESS at 0x0. Skip such frames (the video path tolerates the same corruption).
         guard sf.pointee.nb_samples > 0,
               let ext = sf.pointee.extended_data,
-              ext.pointee != nil else { return }
+              ext.pointee != nil else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         // Align swr's INPUT to the frame the decoder actually produced before converting. No-op once the seed
         // matched (the usual case); only a wrong init seed or a genuine mid-stream format change rebuilds swr.
         reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc)
         // The rebuild reuses the context pointer on success, but swr_alloc_set_opts2 frees it on a set-opts
         // failure (swr_free(ps) -> swrCtx == nil), which would dangle the caller's `swr`. Re-bind to the live one.
-        guard let swr = swrCtx else { return }
+        guard let swr = swrCtx else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         let outNbSamples = swr_get_out_samples(swr, sf.pointee.nb_samples)
-        guard outNbSamples > 0 else { return }
+        guard outNbSamples > 0 else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         let nChannels = enc.pointee.ch_layout.nb_channels
         let isPlanar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
@@ -827,16 +947,20 @@ final class AudioBridge: @unchecked Sendable {
                 )
             }
         }
-        guard producedSamples > 0 else { return }
+        guard producedSamples > 0 else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         // av_audio_fifo_write takes void **data; the same array works for both layouts (FIFO knows the format).
-        _ = outPtrs.withUnsafeMutableBufferPointer { fifoBuf in
+        let written = outPtrs.withUnsafeMutableBufferPointer { fifoBuf in
             fifoBuf.baseAddress!.withMemoryRebound(
                 to: UnsafeMutableRawPointer?.self, capacity: bufferCount
             ) { rebound in
                 av_audio_fifo_write(fifo, rebound, producedSamples)
             }
         }
+        if written > 0 { stats.samplesEnqueued += Int64(written) }
     }
 
     /// Pull frame_size chunks from the FIFO and encode each. requireFull true stops below frame_size (streaming);
@@ -904,11 +1028,14 @@ final class AudioBridge: @unchecked Sendable {
                     break
                 }
                 if recvRet < 0 {
+                    stats.encodeErrors += 1
+                    stats.lastEncodeErrorCode = recvRet
                     var p: UnsafeMutablePointer<AVPacket>? = outPkt
                     trackedPacketFree(&p)
                     break
                 }
                 outputBytesLifetime += Int64(outPkt.pointee.size)
+                stats.packetsEmitted += 1
                 results.append(outPkt)
             }
         }

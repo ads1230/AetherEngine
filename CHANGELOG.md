@@ -10,7 +10,31 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A transcoding audio bridge that produces nothing now says so, instead of dying as a muxer error two
+  subsystems downstream (AE#396).** A plain SD MKV with mono MP3 audio failed on the native route at
+  nine of nine start positions, ending on `Source audio cannot be muxed (code -22)` after three
+  identical revive attempts. The muxer was right and innocent: FFmpeg's mp4 muxer can only build an
+  AC-3/E-AC-3 sample entry from a packet that has been written, and for a bridged source those packets
+  come from the bridge's encoder, which had emitted none. Nothing anywhere in the session said that.
+  Every step between a source packet and an encoded frame ends in a `return` or in a loop that stops on
+  a negative code (a packet the decoder rejects, a decoder that answers nothing, a resample that
+  converts to zero samples, an encoder that keeps its output), which is correct per packet and silent in
+  aggregate, so a bridge that emitted nothing for a whole first segment was indistinguishable from one
+  that had simply not been asked yet. `AudioBridge` now counts each of those arms and keeps the
+  decoder's own error code, reports once (`AE#396 the bridge has produced no encoded audio at all`) as
+  soon as enough source has gone in for the silence to be structural, and the deferred first cut prints
+  the bridge's account instead of announcing a prime scan it does not run on this path.
+- **A bridged session whose audio decoded to nothing fails immediately and truthfully, rather than
+  spending its revive budget re-reading the same bytes.** A producer restart rebuilds the muxer and
+  re-opens the encoder, both downstream of a failing decoder, so the same bytes were read three times
+  for the same answer. Zero decoded frames now ends the session at once; frames decoded with no packets
+  emitted is the encoder side, which a rebuild does heal, and keeps its revive.
+- **New `PlaybackErrorKind.audioBridgeProducedNoOutput` for that failure.** It used to arrive as
+  `.vodSourceFailed`, which reads as "the source is gone" and ends a host's fallback ladder; the source
+  is neither gone nor unreadable here, and a second player that decodes the track itself plays the file.
+  Hosts with a ladder should demote on this kind, not stop.
 
 ## [6.30.2] - 2026-08-18
 

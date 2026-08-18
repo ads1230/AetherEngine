@@ -196,6 +196,23 @@ extension HLSVideoEngine {
                 sessionAudioMoovPrimeUnobtainable = true
                 restartLock.unlock()
             }
+            // AE#396: a bridged session whose DECODER produced not one frame has nothing a revive can
+            // reach. The restart path rebuilds the muxer and re-opens the encoder (#99 failure mode B),
+            // and both sit downstream of the arm that failed: the same decoder is handed the same bytes
+            // and answers the same way, which is exactly what the reporter measured, three attempts with
+            // identical packet counts finishing in 12 to 23 ms. Spend the words instead of the budget.
+            // Frames decoded but nothing emitted is the ENCODER side, which a rebuild does heal, so that
+            // shape keeps its revive.
+            if !isLiveSession, let bridge = prod.audioBridgeFeedStats, bridge.decodedNothing {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#396 the audio bridge decoded nothing, so the mp4 sample entry "
+                    + "can never be built and a revive would re-read the same bytes: \(bridge.summary)",
+                    category: .session
+                )
+                surfaceVODSourceFailure(FFmpegErr.einval, "Audio track could not be decoded",
+                                        kind: .audioBridgeProducedNoOutput)
+                return
+            }
             if isLiveSession {
                 handleLiveMuxerFailure(prod)
             } else {
@@ -590,6 +607,22 @@ extension HLSVideoEngine {
             // with nothing in it to act on. The readError arm above has surfaced its own exhaustion
             // since AE#169; this is the same shape and gets the same last word. -22 is what movenc
             // returns for the moov it cannot write, so the code carries the real cause.
+            //
+            // AE#396: which cause that is depends on whether the audio was bridged. A silent bridge is
+            // not a source that cannot be muxed, it is a source whose audio this engine could not
+            // TRANSCODE, and the two ask a host for opposite things: `vodSourceFailed` reads as "the
+            // source is gone" and ends a fallback ladder, while a second player that decodes the track
+            // itself plays this file. So name the bridge when the bridge is the one that stayed quiet.
+            if let bridge = audioBridge?.feedStats, bridge.packetsEmitted == 0 {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#396 the moov was never buildable because the audio bridge "
+                    + "emitted nothing this session: \(bridge.summary)",
+                    category: .session
+                )
+                surfaceVODSourceFailure(FFmpegErr.einval, "Audio could not be transcoded for playback",
+                                        kind: .audioBridgeProducedNoOutput)
+                return
+            }
             surfaceVODSourceFailure(FFmpegErr.einval, "Source audio cannot be muxed")
             return
         }
