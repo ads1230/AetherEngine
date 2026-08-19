@@ -286,9 +286,17 @@ final class SubtitlePacketStore: @unchecked Sendable {
                 pending = nil
             }
             let firstType = Self.bitmapFirstSegmentType(in: chunk)
-            if firstType == .pgs(0x16) || firstType == .dvb(0x10) {
-                // PGS PCS / DVB page-composition opens a display set; an unfinished predecessor (missing END, or the
-                // restart overlap above) is undecodable on its own and gets dropped.
+            let startsAnchoredDVBSet: Bool
+            if case .dvb(let type) = firstType, type != 0x80, ptsSeconds != nil, pending == nil {
+                startsAnchoredDVBSet = true
+            } else {
+                startsAnchoredDVBSet = false
+            }
+            if firstType == .pgs(0x16) || firstType == .dvb(0x10) || startsAnchoredDVBSet {
+                // PGS PCS / DVB page-composition opens a display set. Some DVB broadcasts
+                // emit display-definition or palette/object segments before page-composition;
+                // when that first DVB segment has a PTS, keep the full set instead of dropping
+                // the HD subtitle packet before the page arrives.
                 pending = nil
                 guard let pts = ptsSeconds else {
                     pendingSetByStream[key] = nil
