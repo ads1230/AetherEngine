@@ -524,6 +524,33 @@ public final class AetherEngine: ObservableObject {
 
     /// Master enable for background playback (iOS: PiP + background audio; tvOS: PiP keepalive). Default on.
     public var backgroundPlaybackEnabled = true
+
+    /// Host-requested audio-only mode for UI states where the picture is
+    /// invisible WITHOUT the app being backgrounded (an inline player whose
+    /// tab was switched away). Reuses the background audio-only machinery on
+    /// the software path: video packets drop at the demux loop, the decoder
+    /// idles, and clearing the flag resyncs video at the next keyframe. The
+    /// foreground-return observer respects this flag so a background/
+    /// foreground cycle can't resurrect video the host still hides; a new
+    /// load re-applies it at host creation. No-op on non-software paths.
+    public private(set) var hostAudioOnlyActive = false
+
+    public func setHostAudioOnly(_ audioOnly: Bool) {
+        guard hostAudioOnlyActive != audioOnly else { return }
+        hostAudioOnlyActive = audioOnly
+        guard let host = softwareHost else { return }
+        if audioOnly {
+            host.enterBackgroundAudioOnly()
+        } else {
+            #if os(iOS) || os(tvOS)
+            if !isBackgrounded {
+                host.exitBackgroundAudioOnly()
+            }
+            #else
+            host.exitBackgroundAudioOnly()
+            #endif
+        }
+    }
     /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
     /// the keepalive policy + pause-safety read it.
     public var pictureInPictureActive = false {
@@ -676,6 +703,13 @@ public final class AetherEngine: ObservableObject {
     /// on interruption end (see the observer in setupLifecycleObservers). Disarmed by user pause()
     /// and stopInternal().
     private var resumeAfterInterruption = false
+
+    /// An interruption deactivated the AVAudioSession under a renderer path (SW/audio host). A
+    /// route-disconnect interruption (AirPods auto-switching away mid-PiP) may never post ENDED,
+    /// so the next play() must reactivate the session itself — setRate against a deactivated
+    /// session silently no-ops: the renderer never consumes, the shared clock stays parked and
+    /// the picture freezes. Cleared by play()'s reactivation and by the next load's activation.
+    private var rendererAudioSessionInterrupted = false
 
     /// Wedge-safe keepalive decision: keep the video pipeline alive on background ONLY while the app stays
     /// genuinely running (PiP active, or actively playing for background audio), never across an idle
@@ -886,6 +920,11 @@ public final class AetherEngine: ObservableObject {
     /// array-clear sites.
     var nextRetainedSubtitleCueID: Int = 0
     nonisolated static let subtitleDrainLeadSeconds: Double = 60
+    /// Live DVR seeks must re-prime subtitles near the landing without
+    /// walking a VOD-sized forward window. The live packet store is fed by
+    /// the active demuxer, not a side prefetcher, and the player only needs
+    /// the active/next line while video catches up after a scrub.
+    nonisolated static let subtitleLiveDrainLeadSeconds: Double = 4
     /// #362: how far the forward prefetch (#151) parks BEYOND the drain window's forward edge.
     ///
     /// Without it the two lines coincide, and that is where a bitmap set loses its authored end: the
@@ -905,6 +944,7 @@ public final class AetherEngine: ObservableObject {
     /// a 15 s hole on a fixture the pump refilled at roughly 4 s of content per second.
     nonisolated static let subtitleDrainHarvestGapTicks: Int = 20
     nonisolated static let subtitleDrainBackscanSeconds: Double = 15
+    nonisolated static let subtitleLiveDrainBackscanSeconds: Double = 8
     nonisolated static let subtitleDrainJumpThresholdSeconds: Double = 2.5
     nonisolated static let subtitleDrainTickNanoseconds: UInt64 = 500_000_000
     /// #271: per-tick decode cap for the overlay drainer, extended to the next PTS boundary
@@ -1402,6 +1442,16 @@ public final class AetherEngine: ObservableObject {
     /// The software path's equivalent (#311), held for the same reason: a `load()` builds a fresh
     /// host, and the observer has to survive it. See `setSoftwareVideoFrameTimeObserver`.
     var softwareVideoFrameTimeObserver: SoftwareVideoFrameTimeObserver?
+
+    /// Full-sample sibling of `softwareVideoFrameTimeObserver`: decoded, composited frames for a
+    /// host re-encoding the picture (AirPlay transcode relay). Held here to survive loads; see
+    /// `setSoftwareVideoSampleTap`.
+    var softwareVideoSampleTap: (@Sendable (CMSampleBuffer) -> Void)?
+
+    /// The audio half of the transcode-relay taps: raw decoded audio sample buffers at the
+    /// source's full channel count (the PCM tap behind `installAudioTap()` is fixed mono). Held
+    /// here to survive loads; see `setSoftwareAudioSampleTap`.
+    var softwareAudioSampleTap: (@Sendable (CMSampleBuffer) -> Void)?
 
     func setPresentationAxis(_ map: PresentationAxisMap) {
         presentationAxis = map
@@ -2494,6 +2544,7 @@ public final class AetherEngine: ObservableObject {
         // Route av_log into EngineLog before any libav* entry point so probe/load diagnostics are captured.
         FFmpegLogBridge.install()
         _ = DeinterlaceHardwareWarmup.shared
+        VTCapabilityProbe.warmUpInBackground()
 
         // Declare category + multichannel support but do NOT activate the session here.
         //
@@ -3391,6 +3442,22 @@ public final class AetherEngine: ObservableObject {
                 EngineLog.emit("[AetherEngine] source is forward-only, forcing software path", category: .engine)
             }
         }
+        // Host opt-in (per load): zap-heavy live sources with long GOPs join the software
+        // path in ~0.5s where the loopback path needs 2 keyframe-aligned segments (see
+        // LoadOptions.preferSoftwareVideoRoute). Honored only where CPU decode is a
+        // comfortable trade: H.264 at 1080p or below with RESOLVED dimensions — a 4K or
+        // HEVC channel on the same provider stays on the hardware-decoded native path.
+        if options.preferSoftwareVideoRoute, !useSoftwarePath,
+           detectedCodecID == AV_CODEC_ID_H264,
+           let vStream = probe.stream(at: probe.videoStreamIndex),
+           let codecpar = vStream.pointee.codecpar,
+           codecpar.pointee.height > 0, codecpar.pointee.height <= 1080 {
+            useSoftwarePath = true
+            EngineLog.emit(
+                "[AetherEngine] host preference: software video route "
+                + "(h264 \(codecpar.pointee.width)x\(codecpar.pointee.height))",
+                category: .engine)
+        }
         // TEST-ONLY: forces SW path for aetherctl live --sw; unset in shipping builds.
         if Self.forceSoftwarePathForTesting {
             useSoftwarePath = true
@@ -3639,6 +3706,17 @@ public final class AetherEngine: ObservableObject {
             }
             return
         }
+        #if os(iOS) || os(tvOS)
+        // An interruption (route disconnect, call) deactivated the session; without
+        // reactivation the renderer's setRate silently no-ops and playback stays frozen.
+        if rendererAudioSessionInterrupted, softwareHost != nil || audioHost != nil {
+            rendererAudioSessionInterrupted = false
+            do { try AVAudioSession.sharedInstance().setActive(true) }
+            catch {
+                EngineLog.emit("[AetherEngine] post-interruption session reactivation failed: \(error)", category: .engine)
+            }
+        }
+        #endif
         activeTransportHost?.play()
         if state == .paused || state == .loading {
             state = .playing
@@ -5379,7 +5457,12 @@ public final class AetherEngine: ObservableObject {
                 guard let self else { return }
                 #if os(iOS)
                 self.cancelBackgroundGraceWindow()
-                self.softwareHost?.exitBackgroundAudioOnly()
+                // A host-requested shed (inline player on a hidden tab)
+                // outlives the background cycle; only the background's own
+                // audio-only mode ends here.
+                if !self.hostAudioOnlyActive {
+                    self.softwareHost?.exitBackgroundAudioOnly()
+                }
                 #endif
                 self.isBackgrounded = false
             }
@@ -5418,6 +5501,16 @@ public final class AetherEngine: ObservableObject {
                     }
                     self.resumeAfterInterruption = intent && stateEligible
                     EngineLog.emit("[AetherEngine] AVAudioSession interruption BEGAN reason=\(reason) resumeArmed=\(self.resumeAfterInterruption) otherAudio=\(session.isOtherAudioPlaying) silenceHint=\(session.secondaryAudioShouldBeSilencedHint)", category: .engine)
+                    // Renderer paths: the system halted the session, the audio renderer stops
+                    // consuming and the shared clock parks — but nothing flips the published
+                    // state, so hosts and the PiP window show "playing" over a frozen frame.
+                    // Mirror the system pause into the transport. Deliberately NOT pause():
+                    // that would disarm the resume above and schedule background teardowns.
+                    if self.softwareHost != nil || self.audioHost != nil {
+                        self.rendererAudioSessionInterrupted = true
+                        self.activeTransportHost?.pause()
+                        if self.state == .playing { self.state = .paused }
+                    }
                 } else {
                     let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
                     // Background: only audio backends may resume (video is torn down / must not restart unseen).

@@ -2912,10 +2912,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             semaphore.signal()
         }
 
+        // A nil delegateQueue leaves data delivery on a default-QoS queue that
+        // starves under device decode load (Thread Performance Checker flags
+        // the inversion against the userInitiated consumer). A starved
+        // delegate stops draining the socket, TCP backpressure fills a
+        // real-time origin's tiny send buffer, and an HDHomeRun DROPS TS
+        // packets — heard/seen as stutter + "Packet corrupt" on a healthy
+        // signal that VLC plays cleanly. Deliver at userInitiated.
+        let streamDelegateQueue = OperationQueue()
+        streamDelegateQueue.maxConcurrentOperationCount = 1
+        streamDelegateQueue.qualityOfService = .userInitiated
+        streamDelegateQueue.name = "aether.avio.streaming-delegate"
         let streamSession = URLSession(
             configuration: Self.makeSessionConfig(longLived: true),
             delegate: delegate,
-            delegateQueue: nil
+            delegateQueue: streamDelegateQueue
         )
         let task = streamSession.dataTask(with: request)
 

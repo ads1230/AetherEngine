@@ -739,6 +739,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AVPlayer, see `SegmentCache`). From `LoadOptions.forwardBufferSegments`; nil -> historical 10.
     let forwardWindowSegments: Int
 
+    /// Runaway guard for live production. It must be larger than the requested DVR window, otherwise
+    /// a legitimate 30-minute buffer can fill more than the old fixed cap before the playlist has
+    /// enough history to slide and evict.
+    private var liveResidentSegmentCap: Int {
+        let windowSeconds = dvrWindowSeconds ?? LiveWindowSizing.liveOnlyFloorSeconds
+        let estimatedSegmentSeconds = max(1.0, liveCutTargetSeconds)
+        let windowSegments = Int(ceil(windowSeconds / estimatedSegmentSeconds))
+        return max(180, windowSegments + forwardWindowSegments + LiveWindowSizing.minSafeSegments)
+    }
+
     /// Session retention budget resolved in `start()`; also bounds the producer's race-ahead on disk
     /// (#207, see `PrefetchDiskBudget`). Live resolves the same budget, so the DVR history the
     /// playlist advertises stays resident; the producer-side prefetch park it also feeds is
@@ -2105,6 +2115,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,
             bufferAheadSegments: forwardWindowSegments,
             prefetchDiskBudgetBytes: retentionBudgetBytes,
+            liveResidentSegmentCap: liveResidentSegmentCap,
             // AE#222: nil until a pump proved this source cuts its first segment before any audio packet
             // arrives; from then on every producer of the session muxes moov from this frame.
             audioMoovPrimeFrame: sessionAudioMoovPrimeFrame,

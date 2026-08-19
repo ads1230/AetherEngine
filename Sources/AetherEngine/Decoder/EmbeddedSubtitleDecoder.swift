@@ -72,7 +72,14 @@ final class EmbeddedSubtitleDecoder {
         }
 
         // Seed bitmap canvas from video dims; PCS overwrites once it arrives (probe can't always determine them upfront).
-        if Self.isBitmapCodec(id) {
+        // DVB is the exception: NEVER seed it. Its rects are authored on the display grid of the stream's
+        // display definition segment, and libavcodec's dvbsubdec applies a DDS to the ctx dims ONLY while
+        // they are still zero — any seed blocks the real value (HD subs are authored 1920x1080 via DDS).
+        // Seeding video dims was also wrong on SD: a live tune can build this decoder before the video
+        // codecpar resolves (callers then pass a 1920x1080 default, skewing every cue on a 576-line
+        // channel). SD streams omit the DDS, leaving ctx dims zero; the decode-time canvas fallback
+        // supplies the ETSI EN 300 743 default display (720x576) for that case.
+        if Self.isBitmapCodec(id), id != AV_CODEC_ID_DVB_SUBTITLE {
             if ctx.pointee.width == 0 { ctx.pointee.width = sourceVideoWidth }
             if ctx.pointee.height == 0 { ctx.pointee.height = sourceVideoHeight }
         }
@@ -193,8 +200,17 @@ final class EmbeddedSubtitleDecoder {
         let endTime = pktPTS + endOffset
 
         // PCS-reported canvas; fall back to source video dims if missing.
-        let canvasW = ctx.pointee.width > 0 ? ctx.pointee.width : sourceVideoWidth
-        let canvasH = ctx.pointee.height > 0 ? ctx.pointee.height : sourceVideoHeight
+        // DVB exception: ETSI EN 300 743 defines the display as 720x576 when the stream
+        // carries no display definition segment (SD broadcasts routinely omit it; HD subs
+        // must send a DDS, which lands in ctx dims). The source-video fallback is wrong
+        // twice over here: live tunes can build this decoder before the video codecpar
+        // resolves (0x0 → the callers' 1920x1080 default), and even resolved MPEG-2 SD
+        // reports 704x576 while DVB rects are authored on the 720-wide grid. A wrong
+        // canvas skews every normalized cue position (bottom-centred rows rendered
+        // mid-left at 1920x1080).
+        let isDVBBitmap = ctx.pointee.codec_id == AV_CODEC_ID_DVB_SUBTITLE
+        let canvasW = ctx.pointee.width > 0 ? ctx.pointee.width : (isDVBBitmap ? 720 : sourceVideoWidth)
+        let canvasH = ctx.pointee.height > 0 ? ctx.pointee.height : (isDVBBitmap ? 576 : sourceVideoHeight)
 
         var bodies: [SubtitleCue.Body] = []
         var textLines: [String] = []
@@ -254,8 +270,11 @@ final class EmbeddedSubtitleDecoder {
         let isClearEvent = bodies.isEmpty
 
         // A teletext page erase carries no rects but must still trim the open page cue (#107).
-        guard endTime > startTime || (isClearEvent && isTeletext) else { return nil }
-        guard !isClearEvent || isPGS || isTeletext else { return nil }
+        // DVB page composition is the same replace-semantics: an empty page (erase) must end the
+        // on-screen cue — dropping it left the old cue to live out its full page timeout (30s on
+        // BBC muxes) and overlap the next page's cues.
+        guard endTime > startTime || (isClearEvent && (isTeletext || isDVBBitmap)) else { return nil }
+        guard !isClearEvent || isPGS || isTeletext || isDVBBitmap else { return nil }
 
         // Bound the dedupe set to prevent unbounded growth on long live sessions (DVB/PGS).
         // Reset only weakens dedupe (a re-emitted duplicate renders as an identical overlay), never correctness.
@@ -313,7 +332,10 @@ final class EmbeddedSubtitleDecoder {
         return SubtitleEvent(
             cues: cues,
             isPGS: isPGS,
-            pgsTrimAt: isPGS ? startTime : nil,
+            // DVB shares PGS's display-set semantics: every page event REPLACES the previous
+            // page, so its start closes any still-open image cue. Without this, each cue ran
+            // to its 30s page-timeout end and stacked over its successor.
+            pgsTrimAt: (isPGS || isDVBBitmap) ? startTime : nil,
             textTrimAt: isTeletext ? startTime : nil,
             isSelfContainedPGS: selfContained
         )

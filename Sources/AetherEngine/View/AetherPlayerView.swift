@@ -80,7 +80,15 @@ public final class AetherPlayerView: PlatformBaseView {
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        #if canImport(AppKit)
+        if hosted === layer {
+            hosted.bounds = bounds
+        } else {
+            hosted.frame = bounds
+        }
+        #else
         hosted.frame = bounds
+        #endif
         CATransaction.commit()
     }
 
@@ -98,15 +106,18 @@ public final class AetherPlayerView: PlatformBaseView {
         #if canImport(UIKit)
         self.layer.addSublayer(layer)
         #elseif canImport(AppKit)
-        self.layer?.addSublayer(layer)
-        // Resize the video layer in lockstep with the view's bounds during a
-        // live window drag. Without this it only catches up on the next layout()
-        // pass, and because an NSView's layer is anchored bottom-left that lag
-        // reads as the image sliding off-center while resizing. Starting at full
-        // bounds with both axes flexible keeps it full-bounds throughout.
+        // macOS PiP's sample-buffer path expects the source layer to be owned
+        // by a real NSView. Hosting it only as a sublayer lets AVKit attach its
+        // private PiP bridge view to NSHostingController.view, which SwiftUI
+        // warns is an unsupported hierarchy.
+        self.layer = layer
         layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         #endif
-        layer.frame = bounds
+        if layer === self.layer {
+            layer.bounds = bounds
+        } else {
+            layer.frame = bounds
+        }
         hostedLayer = layer
         CATransaction.commit()
     }
@@ -117,7 +128,17 @@ public final class AetherPlayerView: PlatformBaseView {
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        #if canImport(AppKit)
+        if hosted === layer {
+            let blankLayer = CALayer()
+            blankLayer.backgroundColor = CGColor.black
+            layer = blankLayer
+        } else {
+            hosted.removeFromSuperlayer()
+        }
+        #else
         hosted.removeFromSuperlayer()
+        #endif
         hostedLayer = nil
         CATransaction.commit()
     }

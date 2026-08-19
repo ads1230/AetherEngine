@@ -116,6 +116,12 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
             logFailureOnce("pool exhausted")
             return buffer
         }
+        // The pool buffer starts bare: without the source's propagatable
+        // attachments (pixel aspect ratio, colour tags) the renderer's format
+        // description loses PAR and the PiP window snaps to the coded frame
+        // shape — anamorphic SD live TV (720x576 @ 16:9) squashes to 5:4 the
+        // moment the first cue composites.
+        CVBufferPropagateAttachments(buffer, output)
         let base = CIImage(cvPixelBuffer: buffer)
         let composited = overlay.composited(over: base)
         ciContext.render(composited, to: output, bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: CGColorSpace(name: CGColorSpace.itur_709))

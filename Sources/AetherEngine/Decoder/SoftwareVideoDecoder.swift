@@ -68,6 +68,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Engaged lazily on first interlaced frame; every subsequent frame routes through it. Guarded by `lock`.
     private let deinterlacer = DeinterlaceFilter()
 
+    /// Inverse telecine (see InverseTelecineFilter). Host-set before `open`;
+    /// engages only on progressive ~29.97fps frames. Guarded by `lock`.
+    var inverseTelecineEnabled = false
+    private let ivtc = InverseTelecineFilter()
+    private var ivtcRateEligible = false
+
     /// Deinterlacer selection + cadence from LoadOptions. Set by the host BEFORE `open`;
     /// applied to the filter there (mutating it mid-stream would need a graph rebuild).
     var deinterlaceConfig = DeinterlaceConfig()
@@ -85,6 +91,49 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// from one that is not.
     private var loggedSendFailure = false
 
+    /// DivX/Xvid "packed bitstream" repair. Packed MPEG-4 ASP ships a P and
+    /// its B-frame in ONE packet (plus N-VOP placeholders), so the two frames
+    /// share one timestamp and the renderer receives out-of-order pts
+    /// (field signature: pts-delta histogram of +67ms/-33ms pairs — visible
+    /// as video jitter under perfect audio). FFmpeg's mpeg4_unpack_bframes
+    /// bitstream filter splits them back into one-frame packets with correct
+    /// individual timestamps; it passes non-packed MPEG-4 through untouched.
+    /// Guarded by `lock`.
+    private var packedBFrameFilter: UnsafeMutablePointer<AVBSFContext>?
+
+    /// Manual port of that BSF for builds whose FFmpeg lacks it (FFmpegBuild
+    /// compiles --disable-bsfs with a whitelist that omits it). Without
+    /// unpacking, libavcodec's own packed handling DISCARDS a large share of
+    /// the companion B-frames ("Discarding excessive bitstream in packed
+    /// xvid") — a missing frame every few slots, i.e. rolling stutter no
+    /// reordering can repair. Logic mirrors mpeg4_unpack_bframes.c: a packet
+    /// with two VOP startcodes is split (first VOP decodes now, second is
+    /// stashed); a subsequent N-VOP placeholder packet (<= 64 B) lends its
+    /// timestamps to the stashed B-frame and is dropped. All guarded by
+    /// `lock`.
+    private var manualUnpackEnabled = false
+    private var stashedPackedB: Data?
+    private var loggedManualUnpack = false
+
+    /// VOP-startcode scan (00 00 01 B6): count, and byte offset of the
+    /// second one. Same naive scan the upstream BSF uses (MPEG-4 part 2 has
+    /// no emulation prevention to confuse it).
+    nonisolated static func scanVOPs(data: UnsafePointer<UInt8>, size: Int) -> (count: Int, secondOffset: Int?) {
+        var found = 0
+        var second: Int?
+        var i = 0
+        while i + 3 < size {
+            if data[i] == 0, data[i + 1] == 0, data[i + 2] == 1, data[i + 3] == 0xB6 {
+                found += 1
+                if found == 2, second == nil { second = i }
+                i += 4
+            } else {
+                i += 1
+            }
+        }
+        return (found, second)
+    }
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
         deinterlacer.config = deinterlaceConfig
@@ -94,6 +143,17 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         timeBase = stream.pointee.time_base
+
+        // Inverse telecine only makes sense at NTSC's ~29.97/30fps: decimate
+        // drops one frame per cycle unconditionally, so any other rate must
+        // never route through it even when the host asked.
+        let afr = stream.pointee.avg_frame_rate
+        if afr.den > 0, afr.num > 0 {
+            let fps = Double(afr.num) / Double(afr.den)
+            ivtcRateEligible = (29.2...30.2).contains(fps)
+        } else {
+            ivtcRateEligible = false
+        }
 
         // Container SAR fallback; see streamSAR. Frames usually carry their own (MPEG-2 seq header, from frame 1).
         //
@@ -148,6 +208,32 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         av_dict_free(&opts)
 
+        if codecpar.pointee.codec_id == AV_CODEC_ID_MPEG4,
+           let bsf = av_bsf_get_by_name("mpeg4_unpack_bframes") {
+            var bsfCtx: UnsafeMutablePointer<AVBSFContext>?
+            if av_bsf_alloc(bsf, &bsfCtx) >= 0, let created = bsfCtx {
+                avcodec_parameters_copy(created.pointee.par_in, codecpar)
+                created.pointee.time_base_in = stream.pointee.time_base
+                if av_bsf_init(created) >= 0 {
+                    packedBFrameFilter = created
+                    EngineLog.emit(
+                        "[SWDecoder] mpeg4_unpack_bframes engaged (packed B-frames split into individually timestamped packets)",
+                        category: .swPlayback
+                    )
+                } else {
+                    var doomed: UnsafeMutablePointer<AVBSFContext>? = created
+                    av_bsf_free(&doomed)
+                }
+            }
+        }
+        if codecpar.pointee.codec_id == AV_CODEC_ID_MPEG4, packedBFrameFilter == nil {
+            manualUnpackEnabled = true
+            EngineLog.emit(
+                "[SWDecoder] mpeg4_unpack_bframes not in this FFmpeg build; manual packed-B unpacking armed",
+                category: .swPlayback
+            )
+        }
+
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
@@ -181,6 +267,116 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
     /// the decoder, while audio kept playing.
     func decode(packet: UnsafeMutablePointer<AVPacket>) {
+        lock.lock()
+        let bsf = packedBFrameFilter
+        let manual = manualUnpackEnabled
+        lock.unlock()
+        guard let bsf else {
+            if manual {
+                decodeUnpackingPackedBFrames(packet)
+            } else {
+                sendAndDrain(packet: packet)
+            }
+            return
+        }
+        // av_bsf_send_packet moves the packet's reference on success, leaving
+        // the caller's packet blank — the caller's unref is then a no-op.
+        // On filter refusal the packet is untouched; decode it unfiltered.
+        guard av_bsf_send_packet(bsf, packet) >= 0 else {
+            sendAndDrain(packet: packet)
+            return
+        }
+        var out = av_packet_alloc()
+        defer { av_packet_free(&out) }
+        guard let outPkt = out else { return }
+        while av_bsf_receive_packet(bsf, outPkt) >= 0 {
+            sendAndDrain(packet: outPkt)
+            av_packet_unref(outPkt)
+        }
+    }
+
+    /// FFmpeg's mpeg4_unpack_bframes MAX_NVOP_SIZE: a packet at or below
+    /// this size after a swap is the N-VOP filler and is discarded rather
+    /// than re-stored.
+    private static let maxNVOPSize = 19
+
+    /// Faithful port of mpeg4_unpack_bframes_filter (verified against the
+    /// upstream C source 2026-08-15). The filter is a rolling ONE-SLOT DELAY
+    /// LINE, not a simple stash-until-filler:
+    ///  - a packet with two VOPs stores the trailing (B) VOP and sends the
+    ///    leading VOP under the packet's own timestamps;
+    ///  - EVERY subsequent single-VOP packet, while something is stored,
+    ///    SWAPS: the stored frame goes out under the incoming packet's
+    ///    timestamps, and the incoming payload takes its place in storage —
+    ///    unless it is the tiny N-VOP filler, which is discarded.
+    /// The first port released the store only on tiny packets, so a pair
+    /// followed by a normal frame emitted pictures into the WRONG timeslots:
+    /// perfectly spaced pts, wrong image per slot — continuous motion jitter
+    /// invisible to every timing probe.
+    private func decodeUnpackingPackedBFrames(_ packet: UnsafeMutablePointer<AVPacket>) {
+        let size = Int(packet.pointee.size)
+        guard size > 0, let data = packet.pointee.data else {
+            sendAndDrain(packet: packet)
+            return
+        }
+        let scan = Self.scanVOPs(data: data, size: size)
+
+        lock.lock()
+        var stash = stashedPackedB
+        lock.unlock()
+
+        if let split = scan.secondOffset {
+            // Packed pair: store the trailing VOP. A still-occupied store
+            // means the N-VOP for it never came; drop it like upstream does.
+            stash = Data(bytes: data + split, count: size - split)
+            lock.lock()
+            let firstSplit = !loggedManualUnpack
+            loggedManualUnpack = true
+            lock.unlock()
+            if firstSplit {
+                EngineLog.emit(
+                    "[SWDecoder] packed-Xvid pair split: delay-line unpacking active",
+                    category: .swPlayback
+                )
+            }
+        }
+
+        if scan.count == 1, let stored = stash {
+            // Swap: the stored frame decodes in THIS packet's timeslot; this
+            // packet's payload waits for the next slot (N-VOP filler is
+            // discarded instead of stored).
+            stash = size <= Self.maxNVOPSize ? nil : Data(bytes: data, count: size)
+            lock.lock()
+            stashedPackedB = stash
+            lock.unlock()
+
+            var holder: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+            defer { av_packet_free(&holder) }
+            guard let out = holder, av_new_packet(out, Int32(stored.count)) >= 0 else { return }
+            _ = stored.withUnsafeBytes { src in
+                memcpy(out.pointee.data, src.baseAddress, stored.count)
+            }
+            out.pointee.pts = packet.pointee.pts
+            out.pointee.dts = packet.pointee.dts
+            out.pointee.duration = packet.pointee.duration
+            out.pointee.stream_index = packet.pointee.stream_index
+            out.pointee.flags = packet.pointee.flags
+            sendAndDrain(packet: out)
+            return
+        }
+
+        lock.lock()
+        stashedPackedB = stash
+        lock.unlock()
+
+        if let split = scan.secondOffset {
+            // Send the leading VOP of the pair under its own timestamps.
+            packet.pointee.size = Int32(split)
+        }
+        sendAndDrain(packet: packet)
+    }
+
+    private func sendAndDrain(packet: UnsafeMutablePointer<AVPacket>) {
         lock.lock()
         guard let ctx = codecContext else { lock.unlock(); return }
         var sendRet = avcodec_send_packet(ctx, packet)
@@ -233,6 +429,27 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
 
             let isInterlaced = (f.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
+            if inverseTelecineEnabled, ivtcRateEligible, !isInterlaced, !deinterlacer.isActive {
+                if ivtc.ensureGraph(frame: f, timeBase: timeBase), ivtc.push(f) >= 0 {
+                    if filtered == nil { filtered = av_frame_alloc() }
+                    if let out = filtered {
+                        while ivtc.pull(into: out) >= 0 {  // decimate holds a 5-frame cycle; push can yield EAGAIN
+                            if out.pointee.pts == Int64.min {
+                                av_frame_unref(out)
+                                continue
+                            }
+                            // Output PTS rides the sink's time_base (decimate
+                            // retimes the link to 4/5 rate), not the stream's.
+                            emit(out, timeBase: ivtc.outputTimeBase)
+                            av_frame_unref(out)
+                        }
+                    }
+                    lock.unlock()
+                    continue
+                }
+                // Filters absent in the linked build or graph failure: fall
+                // through and render unfiltered (judder, but playing).
+            }
             if isInterlaced || deinterlacer.isActive {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
@@ -362,6 +579,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         defer { lock.unlock() }
         // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
         deinterlacer.teardown()
+        ivtc.teardown()
+        if let bsf = packedBFrameFilter { av_bsf_flush(bsf) }
+        stashedPackedB = nil
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
@@ -398,6 +618,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     func close() {
         lock.lock()
         deinterlacer.teardown()
+        ivtc.teardown()
+        if packedBFrameFilter != nil {
+            av_bsf_free(&packedBFrameFilter)
+            packedBFrameFilter = nil
+        }
         if codecContext != nil {
             avcodec_free_context(&codecContext)
         }

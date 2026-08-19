@@ -38,6 +38,29 @@ extension AetherEngine {
         softwareHost?.setVideoFrameTimeObserver(observer)
     }
 
+    /// Deliver every video frame the software path enqueues as the full sample buffer — pixel
+    /// buffer, source-axis PTS and propagated attachments included. The sibling of
+    /// `setSoftwareVideoFrameTimeObserver` for hosts that need the picture itself; re-encoding the
+    /// stream for an AirPlay transcode relay is the motivating case, so frames arrive AFTER the
+    /// deinterlacer and the PiP subtitle compositor (what the tap sees is what the screen shows).
+    ///
+    /// Called on the decode thread and must not block. It outlives a `load()`, so install it once;
+    /// pass nil to remove it. Silent on every other path.
+    public func setSoftwareVideoSampleTap(_ tap: (@Sendable (CMSampleBuffer) -> Void)?) {
+        softwareVideoSampleTap = tap
+        softwareHost?.setVideoSampleTap(tap)
+    }
+
+    /// The audio half of `setSoftwareVideoSampleTap`: every decoded audio sample buffer at the
+    /// source's full channel count and rate, PTS on the source axis. Unlike `installAudioTap()`
+    /// (fixed mono 48 kHz, built for speech analysis) this hands over the buffers as decoded, so
+    /// a re-encoding host keeps stereo. Called on the decode/feeder threads and must not block.
+    /// Outlives `load()`; pass nil to remove. Coexists with an installed PCM tap.
+    public func setSoftwareAudioSampleTap(_ tap: (@Sendable (CMSampleBuffer) -> Void)?) {
+        softwareAudioSampleTap = tap
+        softwareHost?.audioSampleTap = tap
+    }
+
     /// The timebase the software path presents against, or nil on every other path and before a
     /// session exists (#311).
     ///

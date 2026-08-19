@@ -53,6 +53,15 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// AirPlay-transcode tap: the full sample buffer for every frame handed to the queue target
+    /// (pixel buffer, source-axis PTS, propagated attachments), on the decode thread.
+    private var _videoSampleTap: (@Sendable (CMSampleBuffer) -> Void)?
+    func setVideoSampleTap(_ tap: (@Sendable (CMSampleBuffer) -> Void)?) {
+        reorderLock.lock()
+        _videoSampleTap = tap
+        reorderLock.unlock()
+    }
+
     /// #311: moved on by every flush, so a consumer can drop the frame times it recorded for frames the
     /// compositor has since discarded. Guarded by `reorderLock`.
     ///
@@ -390,8 +399,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.lock()
         let observer = _frameEnqueuedObserver
         let generation = _flushGeneration
+        let sampleTap = _videoSampleTap
         reorderLock.unlock()
         observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
+        sampleTap?(sampleBuffer)
 
         enqueueCount += 1
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.

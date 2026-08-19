@@ -270,6 +270,8 @@ extension AetherEngine {
         guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return }
         store.setProtectedStreams(Set(subtitleDrainTargets.values))   // #166: re-assert protection
         let playhead = sourceTime
+        let drainLead = subtitleDrainLeadForCurrentSession
+        let drainBackscan = subtitleDrainBackscanForCurrentSession
         // #271: wall time since the previous tick, so a tick that itself ran long cannot be read as
         // a seek by the next one. See SubtitleOverlayDrainer.drainPlan.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
@@ -281,8 +283,8 @@ extension AetherEngine {
             let plan = SubtitleOverlayDrainer.drainPlan(
                 cursor: subtitleDrainCursors[channel],
                 playhead: playhead,
-                lead: Self.subtitleDrainLeadSeconds,
-                backscan: Self.subtitleDrainBackscanSeconds,
+                lead: drainLead,
+                backscan: drainBackscan,
                 jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
                 elapsedSinceLastPlan: elapsed)
             if Self.subtitleForwardPrefetchNeedsReanchor(plan: plan, hadCursor: hadCursor) {
@@ -567,6 +569,14 @@ extension AetherEngine {
 
     // MARK: - #151: subtitle forward prefetch
 
+    var subtitleDrainLeadForCurrentSession: Double {
+        (isLive || loadedOptions.isLive) ? Self.subtitleLiveDrainLeadSeconds : Self.subtitleDrainLeadSeconds
+    }
+
+    var subtitleDrainBackscanForCurrentSession: Double {
+        (isLive || loadedOptions.isLive) ? Self.subtitleLiveDrainBackscanSeconds : Self.subtitleDrainBackscanSeconds
+    }
+
     /// #151: forward prefetch runs for VOD sessions only (live content past the edge does not
     /// exist and the pump already rides it), needs an embedded drain target (external/sidecar
     /// tracks hold whole files, CC is tap-fed) and a loaded source to open a side demuxer on.
@@ -611,8 +621,14 @@ extension AetherEngine {
             return
         }
         cancelSubtitleForwardPrefetcher()
+        // The published isLive is reset to false by stopInternal, and the
+        // reload paths (audio-switch, background-return) replay the subtitle
+        // selection inside that window — gating on the transient property let
+        // the VOD-only prefetcher open second live connections to broadcast
+        // origins (observed: an extra HDHomeRun tuner session after an
+        // audio-track switch on live TV). loadedOptions is the durable truth.
         guard Self.shouldRunSubtitleForwardPrefetch(
-            isLive: isLive,
+            isLive: isLive || loadedOptions.isLive,
             hasEmbeddedDrainTargets: !subtitleDrainTargets.isEmpty,
             hasSource: loadedURL != nil),
             let store = activeSubtitlePacketStore,

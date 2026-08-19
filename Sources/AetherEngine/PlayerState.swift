@@ -237,6 +237,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// (AetherEngine#195/#208).
     public var liveJoinProfile: LiveJoinProfile = .standard
 
+    /// Route this load's video through SoftwarePlaybackHost even when the native loopback path could
+    /// take it. The loopback path's join cost scales with the source's keyframe interval (the segment
+    /// producer cuts at keyframes and fastZap serves after two segments): a 10s-GOP IPTV stream takes
+    /// 6-8s to first frame natively but ~0.5s on the software path, which decodes from the first
+    /// keyframe it sees. Trade-off: libavcodec CPU decode instead of VideoToolbox. Ignored for
+    /// `nativeRemoteHLS`. Default `false`.
+    public var preferSoftwareVideoRoute: Bool = false
+
     /// AVPlayer item from the remote URL directly (Jellyfin live `master.m3u8`): no demuxer probe, no loopback. AVPlayer manages live edge / reconnect. Pair with `isLive: true`. Default `false`.
     public var nativeRemoteHLS: Bool
 
@@ -380,6 +388,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// Deinterlacer for the software-decode path: `.auto` (default) tries the Metal/VideoToolbox
     /// hardware graph and falls back to software bwdif; `.software` forces the CPU path. See
     /// `DeinterlaceMode`.
+    /// Inverse telecine on the software-decode path: drop the baked 3:2
+    /// pulldown duplicate in ~29.97fps NTSC film transfers and retime to
+    /// 23.976 (fieldmatch+decimate; requires them in the linked FFmpeg
+    /// build, silently unavailable otherwise). Off by default because
+    /// decimate always drops one frame per 5-frame cycle; the engine
+    /// additionally gates on a ~29.97fps nominal rate.
+    public var inverseTelecine: Bool = false
+
     public var deinterlaceMode: DeinterlaceMode = .auto
 
     /// Cadence of the hardware deinterlacer: `.field` (default) doubles output to field rate
@@ -410,6 +426,7 @@ public struct LoadOptions: Sendable, Equatable {
         dvrWindowSeconds: Double? = nil,
         liveBlockingReload: Bool? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
+        preferSoftwareVideoRoute: Bool = false,
         nativeRemoteHLS: Bool = false,
         nativeRemoteHLSIngestFallback: Bool = true,
         preserveASSMarkup: Bool = false,
@@ -428,6 +445,7 @@ public struct LoadOptions: Sendable, Equatable {
         forwardBufferSegments: Int? = nil,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
+        inverseTelecine: Bool = false,
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field
     ) {
@@ -443,6 +461,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveBlockingReload = liveBlockingReload
         self.liveJoinProfile = liveJoinProfile
+        self.preferSoftwareVideoRoute = preferSoftwareVideoRoute
         self.nativeRemoteHLS = nativeRemoteHLS
         self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
         self.preserveASSMarkup = preserveASSMarkup
@@ -461,6 +480,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.forwardBufferSegments = forwardBufferSegments
         self.autoplay = autoplay
         self.teletextPage = teletextPage
+        self.inverseTelecine = inverseTelecine
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
     }

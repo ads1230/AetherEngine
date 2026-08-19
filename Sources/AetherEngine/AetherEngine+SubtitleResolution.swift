@@ -30,14 +30,16 @@ extension AetherEngine {
     ) -> SubtitleResolutionStatement.Statement {
         let fence = subtitleResolutionFence
         let cursor = subtitleDrainCursors[channel]
+        let drainLead = subtitleDrainLeadForCurrentSession
+        let drainBackscan = subtitleDrainBackscanForCurrentSession
         return SubtitleResolutionStatement.make(
             fence: fence,
             streamIndex: streamIndex,
-            coveredFrom: cursor?.coverageStart ?? (playhead - Self.subtitleDrainBackscanSeconds),
+            coveredFrom: cursor?.coverageStart ?? (playhead - drainBackscan),
             // The DRAIN lead, not the prefetcher's: the statement is about decoded display state,
-            // and the drainer's window is fixed at `subtitleDrainLeadSeconds` even while the OCR
-            // worker has the prefetcher running 270 s ahead to feed it.
-            windowThrough: playhead + Self.subtitleDrainLeadSeconds,
+            // and the drainer's window is fixed for the current session kind even while the OCR
+            // worker has the VOD prefetcher running 270 s ahead to feed it.
+            windowThrough: playhead + drainLead,
             decodedThrough: cursor?.lastDecodedPts ?? .nan,
             prefetchFrontier: SubtitlePrefetchTelemetry.resolutionFrontier(matching: fence),
             prefetchAtEndOfFile: SubtitlePrefetchTelemetry.reachedEndOfFile(matching: fence),

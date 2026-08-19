@@ -594,12 +594,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// safe (see BackpressureWedgeDetector.fastBreakThresholdSeconds).
     private static let backpressureWedgeFastBreakThresholdSeconds = 5
 
-    /// Live disk runaway cap for awaitLiveWindowHeadroom. In healthy play resident count tracks the
-    /// sliding window (~windowSegmentCount plus a few in flight) because every playlist build slides
-    /// evictBelow. It can only approach this cap when the consumer stopped polling entirely (dead
-    /// item), at which point the engine's stall watchdogs reload the item within ~12 s, so a park
-    /// here is diagnostic, never steady state. ~6 min of 2 s GOP segments.
-    private static let liveResidentSegmentCap = 180
+    /// Default live disk runaway cap for awaitLiveWindowHeadroom. Sessions with a host-requested DVR
+    /// window override this with a cap large enough to hold the advertised window plus a little
+    /// forward slack. The cap is diagnostic, not the window size: it should trip only when the
+    /// consumer has stopped polling entirely.
+    private static let defaultLiveResidentSegmentCap = 180
+
+    /// Per-session live resident cap. A fixed 180-segment cap is too small for large DVR windows
+    /// (for example 30 minutes at ~2s segments): the producer can hit the cap before the live
+    /// playlist has enough history to slide and evict, parking the stream during normal playback.
+    private let liveResidentSegmentCap: Int
 
     static func qosName(_ c: qos_class_t) -> String {
         switch c {
@@ -916,6 +920,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packedSideAudioFallbackDurationPts: Int64 = 0,
         bufferAheadSegments: Int = 10,
         prefetchDiskBudgetBytes: Int = 0,
+        liveResidentSegmentCap: Int = HLSSegmentProducer.defaultLiveResidentSegmentCap,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioMoovPrimeKnownUnobtainable: Bool = false,
         epoch: UInt64 = 0
@@ -927,6 +932,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             audio.map { MP4SegmentMuxer.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.bufferAheadSegments = bufferAheadSegments
         self.prefetchDiskBudgetBytes = prefetchDiskBudgetBytes
+        self.liveResidentSegmentCap = max(Self.defaultLiveResidentSegmentCap, liveResidentSegmentCap)
         self.demuxer = demuxer
         self.sideAudioDemuxer = sideAudioDemuxer
         // Packed side audio: synthesize timestamps from ID3 PRIV anchor; TS-side sessions use real timestamps.
@@ -1295,13 +1301,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the engine's 12 s stall watchdogs reload the item (and thus issue a fresh GET) long before then.
     /// Lowering the cap toward the steady-state window would put that deadlock back within reach.
     private func awaitLiveWindowHeadroom(head: Int) -> Bool {
-        if cache.count < Self.liveResidentSegmentCap { return true }
+        if cache.count < liveResidentSegmentCap { return true }
         // #240: a parked pump is not using the link.
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         while !checkShouldStop() {
-            if cache.count < Self.liveResidentSegmentCap {
+            if cache.count < liveResidentSegmentCap {
                 EngineLog.emit(
                     "[HLSSegmentProducer] live headroom released head=\(head) after=\(parked)s "
                     + "resident=\(cache.count)",
@@ -1312,7 +1318,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if parked % 10 == 0 {
                 EngineLog.emit(
                     "[HLSSegmentProducer] live headroom PARK head=\(head) resident=\(cache.count) "
-                    + "cap=\(Self.liveResidentSegmentCap) parked=\(parked)s (playlist polls stopped?)",
+                    + "cap=\(liveResidentSegmentCap) parked=\(parked)s (playlist polls stopped?)",
                     category: .session
                 )
             }

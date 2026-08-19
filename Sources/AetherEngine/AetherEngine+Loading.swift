@@ -1404,6 +1404,7 @@ extension AetherEngine {
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate
         )
+        host.inverseTelecineEnabled = loadedOptions.inverseTelecine
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }
@@ -1415,6 +1416,11 @@ extension AetherEngine {
         // #311: a load builds a new host and a new renderer, so an observer installed once by the
         // host app has to be carried across the seam, exactly as the native session does at load.
         host.setVideoFrameTimeObserver(softwareVideoFrameTimeObserver)
+        host.setVideoSampleTap(softwareVideoSampleTap)
+        host.audioSampleTap = softwareAudioSampleTap
+        // A load while the host still hides the picture (zap from a hidden
+        // tab) starts the new session audio-only too.
+        if hostAudioOnlyActive { host.enterBackgroundAudioOnly() }
         // #353: the settled picture size, wired next to the frame times because a host laying out an
         // overlay needs the rectangle as well as the clock, and both come off this renderer.
         mirrorSoftwareDisplaySize(from: host.$videoDisplaySize, storeIn: &softwareCancellables)

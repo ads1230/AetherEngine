@@ -7,6 +7,17 @@ import Libavutil
 /// Cached VTIsHardwareDecodeSupported probe after VTRegisterSupplementalVideoDecoderIfAvailable. Cached on first access; registration is idempotent.
 enum VTCapabilityProbe {
 
+    /// Touches `av1Available` on a background queue so the supplemental-decoder registration
+    /// (seconds of media-daemon spin-up on a device's first use) is paid at engine init instead of
+    /// inside the first `load` — measured as ~5s between streamsProbed and displayPrepared on an
+    /// iPhone's first tune. `static let` gives dispatch-once semantics, so a load racing the
+    /// warm-up simply blocks on the same probe rather than running a second one.
+    static func warmUpInBackground() {
+        DispatchQueue.global(qos: .utility).async {
+            _ = av1Available
+        }
+    }
+
     /// True only when AVPlayer's HLS-fMP4 pipeline can HW-decode AV1. Apple's dav1d (macOS 14+/iOS 17+) is reachable via direct file playback but NOT via AVPlayer HLS in practice (verified 2026-05-14 on M1 macOS 26.4): VTIsHardwareDecodeSupported returns false, AVURLAsset.isPlayable returns false. False routes to SoftwarePlaybackHost/dav1d.
     static let av1Available: Bool = {
         if #available(tvOS 26.2, iOS 26.2, macOS 16.0, visionOS 26.2, *) {

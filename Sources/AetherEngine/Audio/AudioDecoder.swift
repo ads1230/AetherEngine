@@ -136,6 +136,19 @@ final class AudioDecoder: @unchecked Sendable {
 
         let inFmt = AVSampleFormat(rawValue: frame.pointee.format)
         let inRate = frame.pointee.sample_rate > 0 ? frame.pointee.sample_rate : sampleRate
+        // Master-clock stability (measured 2026-08-15, iPhone): feeding
+        // non-48kHz LPCM to AVSampleBufferAudioRenderer makes its internal
+        // rate conversion re-sync the synchronizer timebase every second or
+        // so — single-vsync clock stalls (the clock-vs-vsync probe's
+        // unpaired -17ms buckets) that judder video while the frame pts
+        // stream is metronome-perfect (44.1kHz MP3 Xvid rips; 48kHz sources
+        // never showed it). Resample HERE instead, so the renderer always
+        // receives its native 48kHz and never touches the clock. sampleRate
+        // is the resampler OUT rate and flows consistently into the format
+        // description, the 1/sampleRate per-sample duration, and the gapless
+        // clock; the first-buffer pts anchor comes from the frame's
+        // container timestamp, which is rate-independent.
+        sampleRate = 48000
 
         let ret = swr_alloc_set_opts2(
             &swrContext,

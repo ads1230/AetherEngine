@@ -92,14 +92,14 @@ final class AudioLookaheadState: @unchecked Sendable {
     }
 
     /// Raise the cursor to at least `seq` (pump entry alignment with the combined cursor,
-    /// self-heals after ring eviction clamps). Raising means the pump lost track of what
-    /// was fed, so the stale fed PTS is cleared. Returns the aligned cursor.
+    /// self-heals after ring eviction clamps). Do not clear `lastFedPTS` here: the combined
+    /// cursor can legitimately catch up to packets the pump already decoded, and erasing the
+    /// timestamp makes the split live feeder think its audio lead is zero.
     func align(to seq: Int) -> Int {
         lock.lock()
         defer { lock.unlock() }
         if cursor < seq {
             cursor = seq
-            lastFedPTS = .nan
         }
         return cursor
     }

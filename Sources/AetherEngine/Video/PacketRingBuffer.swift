@@ -10,6 +10,9 @@ final class PacketRingBuffer: @unchecked Sendable {
     /// A single packet as returned by `packets(fromPts:)`.
     struct Packet {
         let pts: Double
+        let dts: Double?
+        let duration: Double?
+        let flags: Int32
         let isKeyframe: Bool
         let isVideo: Bool
         let bytes: Data
@@ -19,10 +22,15 @@ final class PacketRingBuffer: @unchecked Sendable {
 
     private struct Entry {
         let pts: Double
+        let dts: Double?
+        let duration: Double?
+        let flags: Int32
         let isKeyframe: Bool
         let isVideo: Bool
         let fileURL: URL
         let byteCount: Int
+        var memoryBytes: Data?
+        var spilledToDisk: Bool
     }
 
     // MARK: - State
@@ -30,6 +38,8 @@ final class PacketRingBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private let windowSeconds: Double
     private let scratch: URL
+    private let spillQueue: DispatchQueue
+    private let hotMemorySeconds: Double
 
     private var entries: [Entry] = []
     /// Sequence number of `entries[0]`; eviction advances this instead of renumbering. Feeder cursor below `firstSeq` = fell out of window.
@@ -43,6 +53,11 @@ final class PacketRingBuffer: @unchecked Sendable {
     init(windowSeconds: Double, scratch: URL) throws {
         self.windowSeconds = windowSeconds
         self.scratch = scratch
+        self.spillQueue = DispatchQueue(
+            label: "AetherEngine.PacketRingBuffer.spill.\(UUID().uuidString)",
+            qos: .utility
+        )
+        self.hotMemorySeconds = min(20, max(4, windowSeconds))
     }
 
     /// Idempotent teardown. State is cleared synchronously so the ring is immediately
@@ -65,16 +80,42 @@ final class PacketRingBuffer: @unchecked Sendable {
 
     // MARK: - Writer
 
-    func append(pts: Double, isKeyframe: Bool, isVideo: Bool, bytes: Data) throws {
+    func append(
+        pts: Double,
+        dts: Double?,
+        duration: Double?,
+        flags: Int32,
+        isKeyframe: Bool,
+        isVideo: Bool,
+        bytes: Data
+    ) throws {
         let fileURL = scratch.appendingPathComponent("pkt-\(nextCounter()).bin")
-        try bytes.write(to: fileURL, options: [.atomic])
-        let entry = Entry(pts: pts, isKeyframe: isKeyframe, isVideo: isVideo, fileURL: fileURL, byteCount: bytes.count)
+        let entry = Entry(
+            pts: pts,
+            dts: dts,
+            duration: duration,
+            flags: flags,
+            isKeyframe: isKeyframe,
+            isVideo: isVideo,
+            fileURL: fileURL,
+            byteCount: bytes.count,
+            memoryBytes: bytes,
+            spilledToDisk: false
+        )
 
         lock.lock()
         entries.append(entry)
         if pts > edge { edge = pts }
+        trimHotMemoryLocked()
         let evictedURLs = evictLocked()
         lock.unlock()
+
+        spillQueue.async { [weak self, fileURL, bytes] in
+            // Live playback consumes the hot in-memory entry. DVR rewind uses
+            // this background spill so filesystem latency cannot stall demux.
+            try? bytes.write(to: fileURL, options: [])
+            self?.markSpilled(fileURL: fileURL)
+        }
 
         for url in evictedURLs {  // delete outside the lock; removeItem is filesystem I/O
             try? FileManager.default.removeItem(at: url)
@@ -99,10 +140,29 @@ final class PacketRingBuffer: @unchecked Sendable {
         lock.unlock()
 
         var packets = slice.compactMap { entry -> Packet? in
+            if let data = entry.memoryBytes {
+                return Packet(
+                    pts: entry.pts,
+                    dts: entry.dts,
+                    duration: entry.duration,
+                    flags: entry.flags,
+                    isKeyframe: entry.isKeyframe,
+                    isVideo: entry.isVideo,
+                    bytes: data
+                )
+            }
             guard let data = try? Data(contentsOf: entry.fileURL, options: [.alwaysMapped, .uncached]) else {
                 return nil
             }
-            return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe, isVideo: entry.isVideo, bytes: data)
+            return Packet(
+                pts: entry.pts,
+                dts: entry.dts,
+                duration: entry.duration,
+                flags: entry.flags,
+                isKeyframe: entry.isKeyframe,
+                isVideo: entry.isVideo,
+                bytes: data
+            )
         }
         // Off-lock reads can race deferred eviction deletions: trim to the first video keyframe to guarantee a clean decode start.
         if packets.contains(where: { $0.isVideo }),
@@ -132,10 +192,18 @@ final class PacketRingBuffer: @unchecked Sendable {
         }
         let entry = entries[idx]
         lock.unlock()
+        if let data = entry.memoryBytes {
+            return Packet(pts: entry.pts, dts: entry.dts,
+                          duration: entry.duration, flags: entry.flags,
+                          isKeyframe: entry.isKeyframe, isVideo: entry.isVideo,
+                          bytes: data)
+        }
         guard let data = try? Data(contentsOf: entry.fileURL,
                                    options: [.alwaysMapped, .uncached]) else { return nil }
-        return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe,
-                      isVideo: entry.isVideo, bytes: data)
+        return Packet(pts: entry.pts, dts: entry.dts,
+                      duration: entry.duration, flags: entry.flags,
+                      isKeyframe: entry.isKeyframe, isVideo: entry.isVideo,
+                      bytes: data)
     }
 
     func seq(forKeyframeAtOrBefore target: Double) -> Int? {
@@ -165,6 +233,12 @@ final class PacketRingBuffer: @unchecked Sendable {
         return entries.first.map(\.pts)
     }
 
+    var newestPts: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return edge.isFinite ? edge : nil
+    }
+
     // MARK: - Internal
 
     private func nextCounter() -> Int {
@@ -173,6 +247,27 @@ final class PacketRingBuffer: @unchecked Sendable {
         let c = counter
         counter += 1
         return c
+    }
+
+    private func markSpilled(fileURL: URL) {
+        lock.lock()
+        if let idx = entries.firstIndex(where: { $0.fileURL == fileURL }) {
+            entries[idx].spilledToDisk = true
+            if entries[idx].pts < edge - hotMemorySeconds {
+                entries[idx].memoryBytes = nil
+            }
+        }
+        lock.unlock()
+    }
+
+    /// Keep recent live-edge packets hot in memory so playback never depends
+    /// on per-packet filesystem latency. Older entries release RAM only after
+    /// their async disk spill has landed.
+    private func trimHotMemoryLocked() {
+        let cutoff = edge - hotMemorySeconds
+        for idx in entries.indices where entries[idx].pts < cutoff && entries[idx].spilledToDisk {
+            entries[idx].memoryBytes = nil
+        }
     }
 
     /// Drop leading entries outside `edge - windowSeconds`, keyframe-aligned. Forward scan: backward scan walked ~150k entries per append at 80 pkt/s; forward scan touches a few hundred at most. Caller deletes returned URLs after releasing the lock.
