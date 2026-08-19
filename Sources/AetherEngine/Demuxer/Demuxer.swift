@@ -713,11 +713,11 @@ public final class Demuxer: @unchecked Sendable {
         return tracks
     }
 
-    /// #112: PGS subtitle streams whose display sets arrive split across PES packets and need
-    /// reassembly in the SubtitlePacketStore. Only the MPEG-TS demuxer splits them (Blu-ray
-    /// authoring: PCS|WDS|PDS|ODS|END as separate PES packets, some without a PTS); Matroska
-    /// carries one complete set per packet and must NOT be assembled (converters there strip
-    /// the trailing END, which the decoder's synthetic-END flush rescues per packet).
+    /// #112: bitmap subtitle streams whose display sets arrive split across PES packets and need
+    /// reassembly in the SubtitlePacketStore. MPEG-TS can split Blu-ray PGS
+    /// (PCS|WDS|PDS|ODS|END) and DVB subtitle display sets (page/region/CLUT/object/DDS/END)
+    /// across packets, some without a PTS; per-packet storage drops or collapses the middle
+    /// pieces. Matroska carries one complete set per packet and must NOT be assembled.
     /// #151: every AVMEDIA_TYPE_SUBTITLE stream index; the forward prefetcher's route + keep set.
     func subtitleStreamIndices() -> Set<Int32> {
         guard let ctx = formatContext else { return [] }
@@ -777,8 +777,10 @@ public final class Demuxer: @unchecked Sendable {
         for i in 0..<Int(ctx.pointee.nb_streams) {
             guard let stream = ctx.pointee.streams[i],
                   let codecpar = stream.pointee.codecpar,
-                  codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE,
-                  codecpar.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE else { continue }
+                  codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+            let id = codecpar.pointee.codec_id
+            guard id == AV_CODEC_ID_HDMV_PGS_SUBTITLE
+                    || id == AV_CODEC_ID_DVB_SUBTITLE else { continue }
             indices.insert(Int32(i))
         }
         return indices

@@ -56,7 +56,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// so a just-switched-away track stays warm for an instant switch-back.
     static let aggregateByteCap: Int = 96 * 1024 * 1024
 
-    /// Ceiling for one in-assembly PGS display set (a 4K set stays far below this); a pending
+    /// Ceiling for one in-assembly bitmap display set (a 4K set stays far below this); a pending
     /// buffer past it is malformed or mis-parsed and gets dropped rather than grown unbounded.
     static let maxPendingDisplaySetBytes: Int = 16 * 1024 * 1024
 
@@ -69,7 +69,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
         case prefetch
     }
 
-    /// One PGS display set being reassembled from split MPEG-TS PES chunks (see harvestChunk).
+    /// One bitmap display set being reassembled from split MPEG-TS PES chunks (see harvestChunk).
     private struct PendingDisplaySet {
         var ptsSeconds: Double
         var durationSeconds: Double
@@ -236,10 +236,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// for tap packets; no start_time subtraction) and append it. Copies synchronously; the
     /// packet pointer never escapes the calling thread.
     ///
-    /// `assembleSplitDisplaySets` (PGS in MPEG-TS): one display set arrives as several PES
-    /// chunks (PCS|WDS|PDS|ODS|END), some without a PTS and some sharing one; per-packet
-    /// storage would drop or collapse the palette/object segments and every set would fail
-    /// with "Invalid palette id" at its END. Armed streams route through the reassembler.
+    /// `assembleSplitDisplaySets` (bitmap subtitles in MPEG-TS): one display set arrives as
+    /// several PES chunks, some without a PTS and some sharing one; per-packet storage would
+    /// drop or collapse palette/object segments and every set would fail at its END. Armed
+    /// streams route through the reassembler.
     func harvest(streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational,
                  assembleSplitDisplaySets: Bool = false, writer: Writer = .pump) {
         let pts = packet.pointee.pts
@@ -269,9 +269,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
                          webvttSettings: webvttSettings)
             return
         }
-        // The assembly path below is PGS display sets; those carry no WebVTT settings.
-        // Mirror the decoder's SUP-wrapper rule: strip a leading "PG" 10-byte header so
-        // concatenated chunks form one clean [type][len BE][body] segment run.
+        // The assembly path below is bitmap display sets; those carry no WebVTT settings.
+        // Mirror the decoder's SUP-wrapper rule for PGS: strip a leading "PG" 10-byte header so
+        // concatenated chunks form one clean [type][len BE][body] segment run. DVB subtitles
+        // keep their 0x0f sync-byte segment headers.
         var chunk = payload
         if chunk.count > 10, chunk[chunk.startIndex] == 0x50, chunk[chunk.startIndex + 1] == 0x47 {
             chunk = chunk.dropFirst(10)
@@ -284,9 +285,9 @@ final class SubtitlePacketStore: @unchecked Sendable {
             if let pts = ptsSeconds, let open = pending, pts < open.ptsSeconds - 1.0 {
                 pending = nil
             }
-            let firstType = Self.pgsFirstSegmentType(in: chunk)
-            if firstType == 0x16 {
-                // PCS opens a display set; an unfinished predecessor (missing END, or the
+            let firstType = Self.bitmapFirstSegmentType(in: chunk)
+            if firstType == .pgs(0x16) || firstType == .dvb(0x10) {
+                // PGS PCS / DVB page-composition opens a display set; an unfinished predecessor (missing END, or the
                 // restart overlap above) is undecodable on its own and gets dropped.
                 pending = nil
                 guard let pts = ptsSeconds else {
@@ -301,7 +302,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
                 pendingSetByStream[key] = nil
                 return
             }
-            let endBoundary = Self.pgsEndBoundary(in: chunk)
+            let endBoundary = Self.bitmapEndBoundary(in: chunk)
             let consumed: Data
             if let endBoundary {
                 consumed = chunk.prefix(endBoundary)
@@ -327,23 +328,42 @@ final class SubtitlePacketStore: @unchecked Sendable {
         }
     }
 
-    // MARK: - PGS segment walk (defensive, mirrors EmbeddedSubtitleDecoder's walks)
+    // MARK: - Bitmap segment walk (defensive, mirrors EmbeddedSubtitleDecoder's walks)
 
-    /// Type byte of the first segment, or nil when the chunk is too short.
-    static func pgsFirstSegmentType(in payload: Data) -> UInt8? {
-        payload.count >= 3 ? payload[payload.startIndex] : nil
+    enum BitmapSegmentType: Equatable {
+        case pgs(UInt8)
+        case dvb(UInt8)
+    }
+
+    /// Type byte of the first PGS/DVB segment, or nil when the chunk is too short.
+    static func bitmapFirstSegmentType(in payload: Data) -> BitmapSegmentType? {
+        guard payload.count >= 3 else { return nil }
+        if payload[payload.startIndex] == 0x0f, payload.count >= 6 {
+            return .dvb(payload[payload.startIndex + 1])
+        }
+        return .pgs(payload[payload.startIndex])
     }
 
     /// Byte offset just past the first END (0x80) segment, or nil when the walk finds none.
-    /// Payload layout: a run of `[type:1][length:2 BE][body:length]`; a malformed length ends
-    /// the scan without reading past the chunk.
-    static func pgsEndBoundary(in payload: Data) -> Int? {
+    /// PGS layout: `[type:1][length:2 BE][body:length]`.
+    /// DVB layout: `[sync:0x0f][type:1][page_id:2][length:2 BE][body:length]`.
+    /// A malformed length ends the scan without reading past the chunk.
+    static func bitmapEndBoundary(in payload: Data) -> Int? {
         let bytes = [UInt8](payload)
         var i = 0
         while i + 3 <= bytes.count {
-            let type = bytes[i]
-            let len = (Int(bytes[i + 1]) << 8) | Int(bytes[i + 2])
-            let next = i + 3 + len
+            let type: UInt8
+            let next: Int
+            if bytes[i] == 0x0f {
+                guard i + 6 <= bytes.count else { return nil }
+                type = bytes[i + 1]
+                let len = (Int(bytes[i + 4]) << 8) | Int(bytes[i + 5])
+                next = i + 6 + len
+            } else {
+                type = bytes[i]
+                let len = (Int(bytes[i + 1]) << 8) | Int(bytes[i + 2])
+                next = i + 3 + len
+            }
             if type == 0x80 { return min(next, bytes.count) }
             if next <= i { break }
             i = next
