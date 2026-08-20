@@ -3450,13 +3450,15 @@ public final class AetherEngine: ObservableObject {
         // Host opt-in (per load): zap-heavy live sources with long GOPs join the software
         // path in ~0.5s where the loopback path needs 2 keyframe-aligned segments (see
         // LoadOptions.preferSoftwareVideoRoute). Honored only where CPU decode is a
-        // comfortable trade: H.264 at 1080p or below with RESOLVED dimensions — a 4K or
-        // HEVC channel on the same provider stays on the hardware-decoded native path.
+        // comfortable trade: SD H.264 with RESOLVED dimensions. 720p/1080i/1080p
+        // broadcast channels can exceed the software renderer's steady-state budget
+        // once decode + deinterlace are both in play, so keep HD on the native
+        // VideoToolbox path even when the host asks for fast-zap software routing.
         if options.preferSoftwareVideoRoute, !useSoftwarePath,
            detectedCodecID == AV_CODEC_ID_H264,
            let vStream = probe.stream(at: probe.videoStreamIndex),
            let codecpar = vStream.pointee.codecpar,
-           codecpar.pointee.height > 0, codecpar.pointee.height <= 1080 {
+           codecpar.pointee.height > 0, codecpar.pointee.height <= 576 {
             useSoftwarePath = true
             EngineLog.emit(
                 "[AetherEngine] host preference: software video route "
