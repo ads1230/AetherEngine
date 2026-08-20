@@ -332,10 +332,10 @@ final class EmbeddedSubtitleDecoder {
         return SubtitleEvent(
             cues: cues,
             isPGS: isPGS,
-            // DVB shares PGS's display-set semantics: every page event REPLACES the previous
-            // page, so its start closes any still-open image cue. Without this, each cue ran
-            // to its 30s page-timeout end and stacked over its successor.
-            pgsTrimAt: (isPGS || isDVBBitmap) ? startTime : nil,
+            // DVB decoders can emit one page as several object events with staggered starts.
+            // Trimming on every non-empty DVB event makes the page erase itself object-by-object;
+            // only an explicit empty DVB page should clear the currently retained bitmaps.
+            pgsTrimAt: isPGS || (isDVBBitmap && isClearEvent) ? startTime : nil,
             textTrimAt: isTeletext ? startTime : nil,
             isSelfContainedPGS: selfContained
         )
