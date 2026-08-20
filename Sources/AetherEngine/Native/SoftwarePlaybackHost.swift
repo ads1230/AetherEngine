@@ -117,6 +117,10 @@ final class SoftwarePlaybackHost {
     /// Read-deadline budget for a reposition (#254). Matches the side reader's positioning budget.
     private static let seekBudgetSeconds: TimeInterval = 8.0
 
+    /// Non-live software seeks decode from a little before the requested target so MPEG-TS/H.264
+    /// streams can reacquire parameter sets and reference frames before the first presented frame.
+    private static let seekDecodePrerollSeconds: TimeInterval = 8.0
+
     /// True while a reposition is awaiting `seekQueue`. Gates the 0.25 s time tick: the synchronizer
     /// still carries the pre-seek anchor, so an ungated tick would walk the OLD position forward for
     /// the length of the reposition and then snap to the target.
@@ -952,7 +956,15 @@ final class SoftwarePlaybackHost {
         if let start = startPosition, start > 0 {
             // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
             // remote source that has to scan for its landing would otherwise block the main thread here.
-            _ = await dem.seekBounded(to: start, timeout: Self.seekBudgetSeconds, on: seekQueue)
+            let decodeStart = Self.decodePrerollStart(for: start, isLive: isLive)
+            if decodeStart < start {
+                EngineLog.emit(
+                    "[SWHost] load decode pre-roll target=\(String(format: "%.3f", start))s "
+                    + "decode=\(String(format: "%.3f", decodeStart))s",
+                    category: .swPlayback
+                )
+            }
+            _ = await dem.seekBounded(to: decodeStart, timeout: Self.seekBudgetSeconds, on: seekQueue)
             // This is load()'s only suspension point, so it is also the only place a stop() can land
             // mid-load. Arming the clock and publishing isReady on a session already torn down would
             // hand the engine a host it has stopped.
@@ -1170,10 +1182,12 @@ final class SoftwarePlaybackHost {
         let sessionTarget = max(0, seconds)
         let sourceZero = softwareSeekSourceZero()
         let sourceTarget = !isLive && sourceZero > 0 ? sessionTarget + sourceZero : sessionTarget
+        let decodeTarget = Self.decodePrerollStart(for: sourceTarget, isLive: isLive)
         EngineLog.emit(
             "[SWHost] seek map session=\(String(format: "%.3f", sessionTarget))s "
             + "zero=\(String(format: "%.3f", sourceZero))s "
-            + "source=\(String(format: "%.3f", sourceTarget))s live=\(isLive ? "YES" : "NO")",
+            + "source=\(String(format: "%.3f", sourceTarget))s "
+            + "decode=\(String(format: "%.3f", decodeTarget))s live=\(isLive ? "YES" : "NO")",
             category: .swPlayback
         )
 
@@ -1183,7 +1197,7 @@ final class SoftwarePlaybackHost {
         currentTime = sessionTarget
         seekInFlight = true
         let outcome = await dem.seekBounded(
-            to: sourceTarget, timeout: Self.seekBudgetSeconds, on: seekQueue,
+            to: decodeTarget, timeout: Self.seekBudgetSeconds, on: seekQueue,
             isSuperseded: { [weak self] in self?.seekGeneration != generation })
         // A newer seek owns the state from here: it published its own target and clears the hold itself.
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
@@ -1192,7 +1206,8 @@ final class SoftwarePlaybackHost {
         seekInFlight = false
         if outcome == .stalled {
             EngineLog.emit(
-                "[SWHost] reposition to \(String(format: "%.2f", sourceTarget))s did not complete within "
+                "[SWHost] reposition to \(String(format: "%.2f", decodeTarget))s "
+                + "(target \(String(format: "%.2f", sourceTarget))s) did not complete within "
                 + "\(String(format: "%.0f", Self.seekBudgetSeconds))s; read position is undefined",
                 category: .swPlayback
             )
@@ -1219,6 +1234,11 @@ final class SoftwarePlaybackHost {
         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
         clockArmed = true
         return outcome
+    }
+
+    private static func decodePrerollStart(for targetSeconds: Double, isLive: Bool) -> Double {
+        guard !isLive, targetSeconds > 0 else { return max(0, targetSeconds) }
+        return max(0, targetSeconds - seekDecodePrerollSeconds)
     }
 
     private func softwareSeekSourceZero() -> Double {
@@ -2285,6 +2305,7 @@ final class SoftwarePlaybackHost {
         // not eat a rebuffer pause at every session start.
         var everHadLead = false
         var parkedSeekGeneration = seekGeneration()
+        var loggedAudioPrerollDrop = false
         // Picture-first hold: audio decoded before the anchor is known parks here
         // (never enqueued pre-timebase; renderer trim of past samples is not a
         // behaviour iOS guarantees). Flushed or dropped at arm time.
@@ -2483,6 +2504,28 @@ final class SoftwarePlaybackHost {
             markClockArmed()
         }
 
+        func dropNonLiveAudioPreroll(_ buffers: inout [CMSampleBuffer]) {
+            guard !isLive, initialClockTime.seconds > 0 else { return }
+            let targetSeconds = initialClockTime.seconds
+            let beforeCount = buffers.count
+            buffers.removeAll { buffer in
+                let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
+                guard pts.isValid else { return false }
+                let duration = CMSampleBufferGetDuration(buffer)
+                let endSeconds = duration.isValid ? pts.seconds + duration.seconds : pts.seconds
+                return endSeconds <= targetSeconds
+            }
+            let dropped = beforeCount - buffers.count
+            if dropped > 0, !loggedAudioPrerollDrop {
+                loggedAudioPrerollDrop = true
+                EngineLog.emit(
+                    "[SWHost] dropped \(dropped) audio pre-roll buffers before "
+                    + "\(String(format: "%.3f", targetSeconds))s",
+                    category: .swPlayback
+                )
+            }
+        }
+
         func demuxIteration() -> Bool {
             if !isPlaying() {
                 condition.lock()
@@ -2505,6 +2548,7 @@ final class SoftwarePlaybackHost {
                     heldPreAnchorAudio.removeAll()
                     lastEnqueuedAudioPtsSec = .nan
                     rebuffering = false
+                    loggedAudioPrerollDrop = false
                     // The lead is zero again after a seek, so the latch has to earn itself back:
                     // keeping it set pauses the clock for a rebuffer on the first post-seek check.
                     everHadLead = false
@@ -2771,6 +2815,7 @@ final class SoftwarePlaybackHost {
                     var pendingBuffers = heldPreAnchorAudio.isEmpty
                         ? buffers : heldPreAnchorAudio + buffers
                     heldPreAnchorAudio.removeAll()
+                    dropNonLiveAudioPreroll(&pendingBuffers)
                     // Arm clock on first decoded audio buffer; latch so subsequent packets don't snap clock back.
                     if !clockArmed(), let firstBuffer = pendingBuffers.first {
                         // #107: anchor at the buffer PTS when it deviates from the load anchor
