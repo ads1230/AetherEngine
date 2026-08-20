@@ -18,6 +18,10 @@ final class EmbeddedSubtitleDecoder {
         let isDVBBitmap: Bool
         /// PTS at which the previous PGS cue should be trimmed. nil for non-PGS.
         let pgsTrimAt: Double?
+        /// PTS at which the previous DVB bitmap page should be replaced. DVB subtitles are
+        /// page-state updates, not independent timed images; every page composition (including
+        /// erase) supersedes the earlier page at its PTS.
+        let dvbPageReplaceAt: Double?
         /// #107: PTS at which earlier open text cues of this track should be trimmed. Set for
         /// every teletext event (content and page-erase): a teletext page is full state, each
         /// transmission replaces the previous one, and libzvbi emits content open-ended
@@ -336,10 +340,8 @@ final class EmbeddedSubtitleDecoder {
             cues: cues,
             isPGS: isPGS,
             isDVBBitmap: isDVBBitmap,
-            // DVB decoders can emit one page as several non-empty object events. Only an explicit
-            // empty page is a clear; trimming every non-empty event makes split pages erase
-            // themselves before the overlay can render them.
-            pgsTrimAt: isPGS || (isDVBBitmap && isClearEvent) ? startTime : nil,
+            pgsTrimAt: isPGS ? startTime : nil,
+            dvbPageReplaceAt: isDVBBitmap ? startTime : nil,
             textTrimAt: isTeletext ? startTime : nil,
             isSelfContainedPGS: selfContained
         )

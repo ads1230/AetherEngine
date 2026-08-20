@@ -433,9 +433,9 @@ extension AetherEngine {
                 if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder) {
                     tally.events += 1
                     tally.cues += event.cues.count
-                    // A cue-less event still matters: a PGS clear composition carries only
-                    // pgsTrimAt and is what removes the line during silence.
-                    if !event.cues.isEmpty || event.pgsTrimAt != nil {
+                    // Cue-less events can still matter: PGS clears, DVB page erases, and
+                    // teletext erases remove stale on-screen subtitle state.
+                    if !event.cues.isEmpty || event.pgsTrimAt != nil || event.dvbPageReplaceAt != nil || event.textTrimAt != nil {
                         if deferDVBSubtitleEventIfNeeded(event, channel: channel, playhead: playhead) {
                             continue
                         }
@@ -956,7 +956,7 @@ extension AetherEngine {
         if let firstCueStart = event.cues.map(\.startTime).min() {
             return firstCueStart
         }
-        return event.pgsTrimAt
+        return event.dvbPageReplaceAt
     }
 
     /// #271: the channel's retained array, bound once per drain tick. Reading it here and writing it
@@ -1033,6 +1033,13 @@ extension AetherEngine {
                 }
             }
         }
+        // DVB bitmap subtitles are page-state updates. A new page composition displayed at PTS
+        // replaces the previous page; otherwise the retained store keeps old bitmap objects alive
+        // until their page timeout and hosts stack or flicker between multiple active pages.
+        if let replaceAt = event.dvbPageReplaceAt,
+           Self.trimDVBBitmapCues(&cues, at: replaceAt) {
+            applied.changed = true
+        }
         // #107: teletext page-state semantics; every event (content or erase) closes earlier
         // open text cues at its start, since libzvbi emits pages open-ended ("until replaced").
         if let trimAt = event.textTrimAt, Self.trimTextCues(&cues, at: trimAt) {
@@ -1081,6 +1088,27 @@ extension AetherEngine {
         }
         return changed
     }
+
+    /// DVB page-state replacement: close older bitmap cues whose window covers the new page PTS.
+    /// A small tolerance preserves multiple objects emitted for the same page display set, which
+    /// may arrive as separate decoder events with the same presentation timestamp.
+    @discardableResult
+    nonisolated static func trimDVBBitmapCues(_ cues: inout [SubtitleCue], at replaceAt: Double) -> Bool {
+        var changed = false
+        for i in 0..<cues.count {
+            guard case .image = cues[i].body else { continue }
+            let cue = cues[i]
+            guard cue.startTime < replaceAt - dvbPageReplacementToleranceSeconds,
+                  cue.endTime > replaceAt else {
+                continue
+            }
+            cues[i] = cue.with(endTime: replaceAt)
+            changed = true
+        }
+        return changed
+    }
+
+    nonisolated static let dvbPageReplacementToleranceSeconds: Double = 0.05
 
     /// #112 full umbau: sorted insert of a decoded cue into the retained store, keeping ascending start order. An
     /// image cue sharing a start AND geometry with an existing image cue REPLACES it: a PGS composition has a
