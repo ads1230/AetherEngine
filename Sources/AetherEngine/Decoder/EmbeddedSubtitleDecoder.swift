@@ -15,6 +15,7 @@ final class EmbeddedSubtitleDecoder {
         /// Empty for PGS clear events (each PGS event implicitly terminates the previous bitmap; AetherEngine applies the trim).
         let cues: [SubtitleCue]
         let isPGS: Bool
+        let isDVBBitmap: Bool
         /// PTS at which the previous PGS cue should be trimmed. nil for non-PGS.
         let pgsTrimAt: Double?
         /// #107: PTS at which earlier open text cues of this track should be trimmed. Set for
@@ -342,6 +343,7 @@ final class EmbeddedSubtitleDecoder {
         return SubtitleEvent(
             cues: cues,
             isPGS: isPGS,
+            isDVBBitmap: isDVBBitmap,
             // DVB decoders can emit one page as several object events with staggered starts.
             // Trimming on every non-empty DVB event makes the page erase itself object-by-object;
             // only an explicit empty DVB page should clear the currently retained bitmaps.

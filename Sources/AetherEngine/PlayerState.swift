@@ -857,9 +857,9 @@ extension SubtitleCue {
     /// store, which meant no embedded track could ever deliver a placement to a host. Rebuilding
     /// through here instead makes the carry-over the default and the drop impossible to write by
     /// accident, including for whatever field is added to the cue next.
-    func with(id: Int? = nil, endTime: Double? = nil, body: Body? = nil) -> SubtitleCue {
+    func with(id: Int? = nil, startTime: Double? = nil, endTime: Double? = nil, body: Body? = nil) -> SubtitleCue {
         SubtitleCue(id: id ?? self.id,
-                    startTime: startTime,
+                    startTime: startTime ?? self.startTime,
                     endTime: endTime ?? self.endTime,
                     body: body ?? self.body,
                     placement: placement)
