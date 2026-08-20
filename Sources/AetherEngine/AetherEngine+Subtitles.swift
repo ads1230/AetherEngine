@@ -919,7 +919,6 @@ extension AetherEngine {
                                     to cues: inout [SubtitleCue],
                                     channel: SubtitleChannel) -> SubtitleDeliveryStatement.Application {
         guard isSubtitleActive(for: channel) else { return .init() }
-        let event = normalizeLiveDVBBitmapEvent(event, playhead: sourceTime)
 
         // #357: primary-only, and budgeted per seek generation rather than per load, so a seek
         // sequence stays observable to its end. The playhead is `sourceTime`, the axis cue
@@ -939,32 +938,6 @@ extension AetherEngine {
         }
 
         return applyEventMutations(event, to: &cues, channel: channel)
-    }
-
-    private func normalizeLiveDVBBitmapEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent,
-                                             playhead: Double) -> EmbeddedSubtitleDecoder.SubtitleEvent {
-        guard event.isDVBBitmap, !event.cues.isEmpty,
-              let firstStart = event.cues.map(\.startTime).min()
-        else { return event }
-
-        let lead = firstStart - playhead
-        guard loadedOptions.isLive, lead > 0.25 else { return event }
-
-        let shift = lead
-        let cues = event.cues.map { cue in
-            let duration = max(0.5, cue.endTime - cue.startTime)
-            let start = cue.startTime - shift
-            return cue.with(startTime: start, endTime: start + duration)
-        }
-
-        return EmbeddedSubtitleDecoder.SubtitleEvent(
-            cues: cues,
-            isPGS: event.isPGS,
-            isDVBBitmap: event.isDVBBitmap,
-            pgsTrimAt: event.pgsTrimAt.map { $0 - shift },
-            textTrimAt: event.textTrimAt,
-            isSelfContainedPGS: event.isSelfContainedPGS
-        )
     }
 
     /// PGS clear-event trim + sorted insert. Native mov_text stores (#55) are NOT fed here; those are owned by the multi-decode reader.

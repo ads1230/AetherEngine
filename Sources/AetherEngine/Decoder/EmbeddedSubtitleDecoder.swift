@@ -200,20 +200,8 @@ final class EmbeddedSubtitleDecoder {
         if isTeletext, endOffset > 120 { endOffset = 120 }
         let startTime: Double
         let endTime: Double
-        if isDVBBitmap {
-            // Live DVB subtitles frequently arrive with decoder display offsets several seconds
-            // ahead of the packet PTS. Applying that full offset on a just-tuned live stream makes
-            // cues miss the active page window; using raw packet PTS makes them visibly early. Cap
-            // the offset so the page has a small presentation delay without disappearing before it
-            // becomes visible.
-            let displayDelay = min(max(startOffset, 0), 1.0)
-            let displayDuration = max(0.5, endOffset - startOffset)
-            startTime = pktPTS + displayDelay
-            endTime = startTime + displayDuration
-        } else {
-            startTime = pktPTS + startOffset
-            endTime = pktPTS + endOffset
-        }
+        startTime = pktPTS + startOffset
+        endTime = pktPTS + endOffset
 
         // PCS-reported canvas; fall back to source video dims if missing.
         // DVB exception: ETSI EN 300 743 defines the display as 720x576 when the stream
