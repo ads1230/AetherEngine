@@ -1090,8 +1090,9 @@ extension AetherEngine {
     }
 
     /// DVB page-state replacement: close older bitmap cues whose window covers the new page PTS.
-    /// A small tolerance preserves multiple objects emitted for the same page display set, which
-    /// may arrive as separate decoder events with the same presentation timestamp.
+    /// Keep only genuinely same-PTS siblings. SD DVB captions often update one subtitle row at a
+    /// time with starts a video frame apart; treating that as the same page leaves old rows visible
+    /// under the new row.
     @discardableResult
     nonisolated static func trimDVBBitmapCues(_ cues: inout [SubtitleCue], at replaceAt: Double) -> Bool {
         var changed = false
@@ -1108,7 +1109,7 @@ extension AetherEngine {
         return changed
     }
 
-    nonisolated static let dvbPageReplacementToleranceSeconds: Double = 0.05
+    nonisolated static let dvbPageReplacementToleranceSeconds: Double = 0.001
 
     /// #112 full umbau: sorted insert of a decoded cue into the retained store, keeping ascending start order. An
     /// image cue sharing a start AND geometry with an existing image cue REPLACES it: a PGS composition has a
