@@ -100,7 +100,8 @@ final class SoftwarePlaybackHost {
     // MARK: - Internals
 
     private let renderer: SampleBufferRenderer
-    /// Swapped per codec at load(): SoftwareVideoDecoder for AV1/VP9, HardwareVideoDecoder for HEVC. Protocol keeps the demux loop codec-agnostic.
+    /// Swapped per codec at load(): SoftwareVideoDecoder for AV1/VP9/MPEG-2,
+    /// HardwareVideoDecoder for VT-decodable H.264/HEVC. Protocol keeps the demux loop codec-agnostic.
     private var videoDecoder: any VideoDecodingPipeline
     private var audioDecoder: AudioDecoder?
     private var audioOutput: AudioOutput?
@@ -802,19 +803,20 @@ final class SoftwarePlaybackHost {
         clockCadenceProbe = probe
         #endif
 
-        // HEVC -> VTDecompressionSession (HW) when VideoToolbox can HW-decode this exact format; everything
+        // H.264/HEVC -> VTDecompressionSession (HW) when VideoToolbox can HW-decode this exact format; everything
         // else -> libavcodec. Replace wholesale to prevent state bleed. #2: HardwareVideoDecoder requires a
         // HW decoder and has no software fallback, so an HEVC Rext (4:2:2/4:4:4/12-bit) stream routed here on
         // hardware without a HW decoder (Intel Macs / older Apple TV) would fail VT session creation and show a
         // black screen. Route those to libavcodec instead, which decodes them. Apple Silicon HW-decodes them,
-        // so the probe keeps HardwareVideoDecoder there.
+        // so the probe keeps HardwareVideoDecoder there. Live HD H.264 also needs this route: it keeps the
+        // fast direct demux/render startup without paying the steady-state cost of libavcodec 1080 decode.
         if let codecpar = vStream.pointee.codecpar,
-           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+           (codecpar.pointee.codec_id == AV_CODEC_ID_H264 || codecpar.pointee.codec_id == AV_CODEC_ID_HEVC),
            VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) {
             videoDecoder.close()
             videoDecoder = HardwareVideoDecoder()
             EngineLog.emit(
-                "[SWHost] selected HardwareVideoDecoder (VT HEVC) for codec_id=\(codecpar.pointee.codec_id.rawValue)",
+                "[SWHost] selected HardwareVideoDecoder (VT) for codec_id=\(codecpar.pointee.codec_id.rawValue)",
                 category: .swPlayback
             )
         } else if !(videoDecoder is SoftwareVideoDecoder) {
@@ -844,7 +846,7 @@ final class SoftwarePlaybackHost {
         (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
         (videoDecoder as? SoftwareVideoDecoder)?.inverseTelecineEnabled = inverseTelecineEnabled
 
-        try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
+        let deliverDecodedFrame: DecodedFrameHandler = { [weak self] pixelBuffer, pts, hdr10PlusData in
             guard let self else { return }
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             // The sequencer restores presentation order for streams whose
@@ -871,6 +873,21 @@ final class SoftwarePlaybackHost {
                     category: .swPlayback
                 )
             }
+        }
+        let openedHardwareDecoder = videoDecoder is HardwareVideoDecoder
+        do {
+            try videoDecoder.open(stream: vStream, onFrame: deliverDecodedFrame)
+        } catch {
+            guard openedHardwareDecoder else { throw error }
+            EngineLog.emit(
+                "[SWHost] HardwareVideoDecoder open failed (\(error)); falling back to SoftwareVideoDecoder",
+                category: .swPlayback
+            )
+            videoDecoder.close()
+            videoDecoder = SoftwareVideoDecoder()
+            (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
+            (videoDecoder as? SoftwareVideoDecoder)?.inverseTelecineEnabled = inverseTelecineEnabled
+            try videoDecoder.open(stream: vStream, onFrame: deliverDecodedFrame)
         }
         videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
             self?.onFirstHDR10PlusDetected?()

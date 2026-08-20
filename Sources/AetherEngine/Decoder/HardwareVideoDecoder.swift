@@ -6,7 +6,7 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// VTDecompressionSession-backed HEVC decoder for the SoftwarePlaybackHost pipeline.
+/// VTDecompressionSession-backed H.264 / HEVC decoder for the SoftwarePlaybackHost pipeline.
 /// Owns the decoded-frame pool, IOSurface lifetime, and session teardown explicitly
 /// (AVPlayer's opaque state grows unbounded on long 4K HDR sessions).
 /// Same surface as SoftwareVideoDecoder so the host can swap without rewiring the demux loop.
@@ -50,6 +50,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var session: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
+    private var codecType: CMVideoCodecType = kCMVideoCodecType_HEVC
+    private var samplesNeedAnnexBConversion = false
     private var width: Int32 = 0
     private var height: Int32 = 0
 
@@ -117,24 +119,49 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
 
-        guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else {
+        let atomKey: String
+        switch codecpar.pointee.codec_id {
+        case AV_CODEC_ID_H264:
+            codecType = kCMVideoCodecType_H264
+            atomKey = "avcC"
+        case AV_CODEC_ID_HEVC:
+            codecType = kCMVideoCodecType_HEVC
+            atomKey = "hvcC"
+        default:
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
 
-        // 1. Build CMVideoFormatDescription from the hvcC extradata via
+        // 1. Build CMVideoFormatDescription from the avcC/hvcC extradata via
         //    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms (same shape AVFoundation uses for .mp4/.mkv).
+        //    MPEG-TS live sources commonly surface Annex-B parameter-set extradata; convert that to a
+        //    config record for VT and convert matching samples in decode().
         guard let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 else {
             throw VideoDecoderError.noExtradata
         }
-        let hvcCData = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+        let sourceConfig = Array(UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
+        let configRecord: [UInt8]
+        if VideoConfigRecord.isAnnexB(sourceConfig),
+           let converted = VideoConfigRecord.fromAnnexB(
+               sourceConfig,
+               codecID: codecpar.pointee.codec_id,
+               width: width,
+               height: height
+           ) {
+            configRecord = converted
+            samplesNeedAnnexBConversion = true
+        } else {
+            configRecord = sourceConfig
+            samplesNeedAnnexBConversion = false
+        }
+        let configData = Data(configRecord)
         var fd: CMVideoFormatDescription?
-        let atomsDict: NSDictionary = ["hvcC": hvcCData]
+        let atomsDict: NSDictionary = [atomKey: configData]
         let extensions: NSDictionary = [
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atomsDict,
         ]
         let fdStatus = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
-            codecType: kCMVideoCodecType_HEVC,
+            codecType: codecType,
             width: width,
             height: height,
             extensions: extensions,
@@ -209,9 +236,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         EngineLog.emit(
-            "[HardwareVideoDecoder] opened HEVC \(width)x\(height) "
+            "[HardwareVideoDecoder] opened \(codecpar.pointee.codec_id == AV_CODEC_ID_H264 ? "H.264" : "HEVC") \(width)x\(height) "
             + "\(use10Bit ? "10-bit" : "8-bit") "
-            + "transfer=\(codecpar.pointee.color_trc.rawValue)",
+            + "transfer=\(codecpar.pointee.color_trc.rawValue) "
+            + "sampleFraming=\(samplesNeedAnnexBConversion ? "annexb->length" : "length")",
             category: .swPlayback
         )
     }
@@ -230,9 +258,26 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // in a CMBlockBuffer+CMSampleBuffer. Copy once: VT may retain the buffer past the call (async decode),
         // and AVPacket storage is reused for the next packet.
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return }
-        let size = Int(packet.pointee.size)
+        var convertedStorage: [UInt8]?
+        if samplesNeedAnnexBConversion {
+            convertedStorage = Self.annexBToLengthPrefixedSample(
+                data: UnsafePointer(data),
+                size: Int(packet.pointee.size)
+            )
+        }
+
+        let size = convertedStorage?.count ?? Int(packet.pointee.size)
+        guard size > 0 else { return }
         let copied = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
-        copied.copyMemory(from: data, byteCount: size)
+        if let convertedStorage {
+            convertedStorage.withUnsafeBytes { bytes in
+                if let base = bytes.baseAddress {
+                    copied.copyMemory(from: base, byteCount: size)
+                }
+            }
+        } else {
+            copied.copyMemory(from: data, byteCount: size)
+        }
 
         var blockBuffer: CMBlockBuffer?
         let blockStatus = CMBlockBufferCreateWithMemoryBlock(
@@ -404,6 +449,41 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         onFrame?(imageBuffer, pts, nil)
+    }
+
+    private static func annexBToLengthPrefixedSample(data: UnsafePointer<UInt8>, size: Int) -> [UInt8]? {
+        guard size > 4 else { return nil }
+        var starts: [(codeOffset: Int, payloadOffset: Int)] = []
+        var i = 0
+        while i + 3 <= size {
+            if data[i] == 0, data[i + 1] == 0, data[i + 2] == 1 {
+                starts.append((i, i + 3))
+                i += 3
+            } else if i + 4 <= size, data[i] == 0, data[i + 1] == 0, data[i + 2] == 0, data[i + 3] == 1 {
+                starts.append((i, i + 4))
+                i += 4
+            } else {
+                i += 1
+            }
+        }
+        guard !starts.isEmpty else { return nil }
+
+        var out: [UInt8] = []
+        out.reserveCapacity(size)
+        for (index, start) in starts.enumerated() {
+            var end = index + 1 < starts.count ? starts[index + 1].codeOffset : size
+            while end > start.payloadOffset, data[end - 1] == 0 {
+                end -= 1
+            }
+            let length = end - start.payloadOffset
+            guard length > 0 else { continue }
+            out.append(UInt8((length >> 24) & 0xff))
+            out.append(UInt8((length >> 16) & 0xff))
+            out.append(UInt8((length >> 8) & 0xff))
+            out.append(UInt8(length & 0xff))
+            out.append(contentsOf: UnsafeBufferPointer(start: data + start.payloadOffset, count: length))
+        }
+        return out.isEmpty ? nil : out
     }
 }
 
