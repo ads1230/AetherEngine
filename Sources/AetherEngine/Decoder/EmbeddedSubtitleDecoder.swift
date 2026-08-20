@@ -706,7 +706,9 @@ final class EmbeddedSubtitleDecoder {
               let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
         else { return nil }
 
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        )
         guard let cgImage = CGImage(
             width: cropW,
             height: cropH,
