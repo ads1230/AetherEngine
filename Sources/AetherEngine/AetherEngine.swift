@@ -2444,6 +2444,11 @@ public final class AetherEngine: ObservableObject {
     /// unobservable; see `SubtitleDeliveryStatement.EventBudget`.
     var subtitleCueDiagnosticBudget = SubtitleDeliveryStatement.EventBudget()
 
+    /// DVB bitmap decoders can emit an event several seconds before its authored display time. The
+    /// event has already advanced decoder page state, so the drainer must retain the decoded result
+    /// instead of rewinding the cursor or applying future clears early.
+    var deferredDVBSubtitleEvents: [SubtitleChannel: [(presentationTime: Double, event: EmbeddedSubtitleDecoder.SubtitleEvent)]] = [:]
+
     /// Trailing retention window for subtitleCues (seconds). Bounds bitmap-cue (PGS/DVB/DVD) memory:
     /// each cue retains a decoded RGBA CGImage; a 2-hr Blu-ray PGS track emits ~1500-2000 cues.
     /// 300 s covers normal pause durations and backward-scrub reach that doesn't trigger a restart;

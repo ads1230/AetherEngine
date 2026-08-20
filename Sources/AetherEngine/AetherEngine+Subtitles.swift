@@ -101,6 +101,7 @@ extension AetherEngine {
         subtitleDrainTargets[.primary] = Int32(index)
         subtitleDrainDecoders[.primary] = nil
         subtitleDrainCursors[.primary] = nil
+        deferredDVBSubtitleEvents[.primary] = nil
         // Phase D: a bitmap track additionally arms the OCR worker feeding its native rendition.
         // Armed BEFORE the prefetcher start so the raised lead is picked up.
         if let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
@@ -178,6 +179,7 @@ extension AetherEngine {
         subtitleDrainTargets[.secondary] = Int32(index)
         subtitleDrainDecoders[.secondary] = nil
         subtitleDrainCursors[.secondary] = nil
+        deferredDVBSubtitleEvents[.secondary] = nil
         startSubtitleDrainer()
         startSubtitleForwardPrefetcher(startAt: startAt)   // #151
         isLoadingSecondarySubtitles = false
@@ -244,6 +246,7 @@ extension AetherEngine {
         subtitleResolutionLastFrontier.removeAll()   // #250
         subtitleResolutionCoverageStated.removeAll()   // #318
         subtitleDeliveryLastOutcome.removeAll()   // #357
+        deferredDVBSubtitleEvents.removeAll()
         cancelSubtitleForwardPrefetcher()   // #151
     }
 
@@ -255,6 +258,7 @@ extension AetherEngine {
         subtitleResolutionLastFrontier[channel] = nil   // #250
         subtitleResolutionCoverageStated.remove(channel)   // #318
         subtitleDeliveryLastOutcome[channel] = nil   // #357
+        deferredDVBSubtitleEvents[channel] = nil
         refreshSubtitleStoreProtection()   // #166
         if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
     }
@@ -299,6 +303,9 @@ extension AetherEngine {
             let isReset: Bool
             switch plan {
             case .idle:
+                var cues = retainedSubtitleCues(for: channel)
+                let applied = applyDueDeferredDVBSubtitleEvents(to: &cues, channel: channel, playhead: playhead)
+                if applied.changed { publishRetainedSubtitleCues(cues, for: channel) }
                 subtitleDrainCursors[channel]?.lastPlayhead = playhead
                 // #276: an idle tick decoded nothing, so it banks nothing into the retained run.
                 // The frontier may well have moved under it; folding that in would claim
@@ -332,6 +339,7 @@ extension AetherEngine {
                 gate.reset()
                 gate.reconstructing = true
                 pgsStaleArrivalGates[channel] = gate
+                deferredDVBSubtitleEvents[channel] = nil
                 window = (from, through)
             }
             if subtitleDrainDecoders[channel] == nil {
@@ -411,6 +419,10 @@ extension AetherEngine {
             // delivered normally.
             var tally = SubtitleDeliveryStatement.Tally()
             tally.packets = decodeEnd
+            let flushedDeferred = applyDueDeferredDVBSubtitleEvents(to: &cues, channel: channel, playhead: playhead)
+            tally.admitted += flushedDeferred.admitted
+            tally.published += flushedDeferred.published
+            if flushedDeferred.changed { didMutate = true }
             // The cursor only advances to an actually-decoded packet's PTS: a window that is
             // empty because the producer has not reached it yet must be rescanned next tick.
             var lastDecoded = subtitleDrainCursors[channel]?.lastDecodedPts
@@ -424,6 +436,9 @@ extension AetherEngine {
                     // A cue-less event still matters: a PGS clear composition carries only
                     // pgsTrimAt and is what removes the line during silence.
                     if !event.cues.isEmpty || event.pgsTrimAt != nil {
+                        if deferDVBSubtitleEventIfNeeded(event, channel: channel, playhead: playhead) {
+                            continue
+                        }
                         let applied = applySubtitleEvent(event, to: &cues, channel: channel)
                         tally.admitted += applied.admitted
                         tally.published += applied.published
@@ -892,6 +907,56 @@ extension AetherEngine {
             WebVTTCueSettings.attach(settings: settings, to: pkt)
         }
         return decoder.decode(packet: pkt, streamTimeBase: AVRational(num: 1, den: 1000))
+    }
+
+    private func deferDVBSubtitleEventIfNeeded(
+        _ event: EmbeddedSubtitleDecoder.SubtitleEvent,
+        channel: SubtitleChannel,
+        playhead: Double
+    ) -> Bool {
+        guard event.isDVBBitmap,
+              let presentationTime = Self.presentationTime(forDVBBitmapEvent: event),
+              presentationTime > playhead + Self.dvbSubtitleApplyToleranceSeconds else {
+            return false
+        }
+        deferredDVBSubtitleEvents[channel, default: []].append((presentationTime, event))
+        deferredDVBSubtitleEvents[channel]?.sort { $0.presentationTime < $1.presentationTime }
+        return true
+    }
+
+    @discardableResult
+    private func applyDueDeferredDVBSubtitleEvents(
+        to cues: inout [SubtitleCue],
+        channel: SubtitleChannel,
+        playhead: Double
+    ) -> SubtitleDeliveryStatement.Application {
+        guard let deferred = deferredDVBSubtitleEvents[channel], !deferred.isEmpty else {
+            return .init()
+        }
+        var remaining: [(presentationTime: Double, event: EmbeddedSubtitleDecoder.SubtitleEvent)] = []
+        var applied = SubtitleDeliveryStatement.Application()
+        for item in deferred {
+            guard item.presentationTime <= playhead + Self.dvbSubtitleApplyToleranceSeconds else {
+                remaining.append(item)
+                continue
+            }
+            let eventApplication = applySubtitleEvent(item.event, to: &cues, channel: channel)
+            applied.admitted += eventApplication.admitted
+            applied.published += eventApplication.published
+            if eventApplication.changed { applied.changed = true }
+        }
+        deferredDVBSubtitleEvents[channel] = remaining.isEmpty ? nil : remaining
+        return applied
+    }
+
+    nonisolated static let dvbSubtitleApplyToleranceSeconds: Double = 0.1
+
+    nonisolated static func presentationTime(forDVBBitmapEvent event: EmbeddedSubtitleDecoder.SubtitleEvent) -> Double? {
+        guard event.isDVBBitmap else { return nil }
+        if let firstCueStart = event.cues.map(\.startTime).min() {
+            return firstCueStart
+        }
+        return event.pgsTrimAt
     }
 
     /// #271: the channel's retained array, bound once per drain tick. Reading it here and writing it
