@@ -1037,7 +1037,7 @@ extension AetherEngine {
         // replaces the previous page; otherwise the retained store keeps old bitmap objects alive
         // until their page timeout and hosts stack or flicker between multiple active pages.
         if let replaceAt = event.dvbPageReplaceAt,
-           Self.trimDVBBitmapCues(&cues, at: replaceAt) {
+           Self.trimDVBBitmapCues(&cues, at: replaceAt, replacingWith: event.cues) {
             applied.changed = true
         }
         // #107: teletext page-state semantics; every event (content or erase) closes earlier
@@ -1090,17 +1090,22 @@ extension AetherEngine {
     }
 
     /// DVB page-state replacement: close older bitmap cues whose window covers the new page PTS.
-    /// Keep only genuinely same-PTS siblings. SD DVB captions often update one subtitle row at a
-    /// time with starts a video frame apart; treating that as the same page leaves old rows visible
-    /// under the new row.
+    /// Cue-less page erases clear the whole bitmap page. Non-empty updates replace only older
+    /// bitmap regions they overlap: SD DVB captions often emit a two-line sentence as separate
+    /// row/object updates one or two video frames apart, and a purely time-based page replacement
+    /// can erase row one when row two arrives.
     @discardableResult
-    nonisolated static func trimDVBBitmapCues(_ cues: inout [SubtitleCue], at replaceAt: Double) -> Bool {
+    nonisolated static func trimDVBBitmapCues(_ cues: inout [SubtitleCue], at replaceAt: Double, replacingWith replacingCues: [SubtitleCue]) -> Bool {
         var changed = false
         for i in 0..<cues.count {
             guard case .image = cues[i].body else { continue }
             let cue = cues[i]
             guard cue.startTime < replaceAt - dvbPageReplacementToleranceSeconds,
                   cue.endTime > replaceAt else {
+                continue
+            }
+            if !replacingCues.isEmpty,
+               !Self.dvbBitmapCue(cue, overlapsAnyOf: replacingCues) {
                 continue
             }
             cues[i] = cue.with(endTime: replaceAt)
@@ -1110,6 +1115,17 @@ extension AetherEngine {
     }
 
     nonisolated static let dvbPageReplacementToleranceSeconds: Double = 0.001
+
+    nonisolated static func dvbBitmapCue(_ cue: SubtitleCue, overlapsAnyOf replacingCues: [SubtitleCue]) -> Bool {
+        guard case .image(let oldImage) = cue.body else { return false }
+        for replacingCue in replacingCues {
+            guard case .image(let newImage) = replacingCue.body else { continue }
+            if oldImage.position.intersects(newImage.position) {
+                return true
+            }
+        }
+        return false
+    }
 
     /// #112 full umbau: sorted insert of a decoded cue into the retained store, keeping ascending start order. An
     /// image cue sharing a start AND geometry with an existing image cue REPLACES it: a PGS composition has a
