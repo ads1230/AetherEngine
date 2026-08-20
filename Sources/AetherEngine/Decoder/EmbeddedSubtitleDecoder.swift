@@ -344,10 +344,10 @@ final class EmbeddedSubtitleDecoder {
             cues: cues,
             isPGS: isPGS,
             isDVBBitmap: isDVBBitmap,
-            // DVB decoders can emit one page as several object events with staggered starts.
-            // Trimming on every non-empty DVB event makes the page erase itself object-by-object;
-            // only an explicit empty DVB page should clear the currently retained bitmaps.
-            pgsTrimAt: isPGS || (isDVBBitmap && isClearEvent) ? startTime : nil,
+            // DVB bitmap events are page replacements on live broadcast streams. Apply the
+            // trim before inserting this event so same-PTS multi-object pages stay atomic, while
+            // older page states do not remain active and fight the current one in the overlay.
+            pgsTrimAt: isPGS || isDVBBitmap ? startTime : nil,
             textTrimAt: isTeletext ? startTime : nil,
             isSelfContainedPGS: selfContained
         )
