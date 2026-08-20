@@ -1223,11 +1223,15 @@ final class SoftwarePlaybackHost {
         // during the reposition rewrite the stash, and a landing that ignored them either overrode the
         // pause (kept playing) or, from the other side, anchored at rate 0 under a running loop.
         if inFlightSeekResumeIntent {
-            // Anchor clock at seek target: clock at .zero + PTS=seekTarget would stall rendering for seekTarget seconds (FigVideoQueueRemote -12080).
-            audioOutput?.seekClock(to: targetTime, rate: lastRate)
+            // Keep the synchronizer parked until the combined demux loop has primed post-seek
+            // video. Starting the source clock before the first target frame reaches the layer
+            // makes rough MPEG-TS seeks look paused/black until enough future samples decode.
+            holdPositiveRateUntilVideoPrime = true
+            audioOutput?.seekClock(to: targetTime, rate: 0)
             isPlaying = true
         } else {
             // Paused seek: anchor at target with rate 0 so play() resumes from the seek position (without this, scrubs freeze or drop all samples).
+            holdPositiveRateUntilVideoPrime = false
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
         }
@@ -1588,6 +1592,7 @@ final class SoftwarePlaybackHost {
                 onClockAnchored: onClockAnchored,
                 seekGeneration: getSeekGeneration,
                 backgroundAudioOnly: getBackgroundAudioOnly,
+                releaseVideoPrimeRateHold: releaseVideoPrimeRateHold,
                 onError: onError,
                 onEnd: onEnd,
                 audioTapSink: getAudioTapSink,
@@ -2255,6 +2260,7 @@ final class SoftwarePlaybackHost {
         onClockAnchored: @Sendable (Double) -> Void,
         seekGeneration: @Sendable () -> UInt64,
         backgroundAudioOnly: @Sendable () -> Bool,
+        releaseVideoPrimeRateHold: @Sendable () -> Bool,
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
@@ -2306,6 +2312,12 @@ final class SoftwarePlaybackHost {
         var everHadLead = false
         var parkedSeekGeneration = seekGeneration()
         var loggedAudioPrerollDrop = false
+        var audioSkipUntilSeconds: Double?
+        var resumeClockAfterVideoPrime = false
+        var videoPrimeReadyAfter: DispatchTime?
+        var videoPrimeForceResumeAfter: DispatchTime?
+        let postSeekVideoPrimeReadyDebounceMs: UInt64 = 160
+        let postSeekVideoPrimeMaxHoldMs: UInt64 = 900
         // Picture-first hold: audio decoded before the anchor is known parks here
         // (never enqueued pre-timebase; renderer trim of past samples is not a
         // behaviour iOS guarantees). Flushed or dropped at arm time.
@@ -2333,6 +2345,38 @@ final class SoftwarePlaybackHost {
                 av_packet_free_safe(p)
             }
             parkedVideo.removeAll()
+        }
+
+        func deadlineReached(_ deadline: DispatchTime?, now: DispatchTime = .now()) -> Bool {
+            guard let deadline else { return false }
+            return now.uptimeNanoseconds >= deadline.uptimeNanoseconds
+        }
+
+        func maybeResumeClockAfterVideoPrime() {
+            guard resumeClockAfterVideoPrime, let aOut = audioOutput else { return }
+            let now = DispatchTime.now()
+            let ready: Bool
+            if #available(tvOS 17.4, iOS 17.4, macOS 14.4, visionOS 1.1, *) {
+                ready = renderer.displayLayer.isReadyForDisplay
+            } else {
+                ready = true
+            }
+            if ready, videoPrimeReadyAfter == nil {
+                videoPrimeReadyAfter = now + .milliseconds(Int(postSeekVideoPrimeReadyDebounceMs))
+            }
+            guard (ready && deadlineReached(videoPrimeReadyAfter, now: now))
+                    || deadlineReached(videoPrimeForceResumeAfter, now: now) else { return }
+            resumeClockAfterVideoPrime = false
+            videoPrimeReadyAfter = nil
+            videoPrimeForceResumeAfter = nil
+            _ = releaseVideoPrimeRateHold()
+            if !ready {
+                EngineLog.emit(
+                    "[SWHost] post-seek video prime hold expired before readyForDisplay; resuming clock",
+                    category: .swPlayback
+                )
+            }
+            aOut.setRate(currentRate())
         }
 
         // Decode+enqueue parked video while the renderer will take it. Never blocks.
@@ -2431,6 +2475,7 @@ final class SoftwarePlaybackHost {
                 releaseRebufferHold("the renderer needs a running clock to take parked video")
                 armFromParkedVideoIfStuck()
                 drainParkedVideoNonblocking()
+                maybeResumeClockAfterVideoPrime()
                 diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
                              parked: parkedVideo.count, rebuffering: rebuffering)
                 if stillWaiting() { Thread.sleep(forTimeInterval: 0.005) }
@@ -2505,8 +2550,7 @@ final class SoftwarePlaybackHost {
         }
 
         func dropNonLiveAudioPreroll(_ buffers: inout [CMSampleBuffer]) {
-            guard !isLive, initialClockTime.seconds > 0 else { return }
-            let targetSeconds = initialClockTime.seconds
+            guard !isLive, let targetSeconds = audioSkipUntilSeconds, targetSeconds > 0 else { return }
             let beforeCount = buffers.count
             buffers.removeAll { buffer in
                 let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
@@ -2516,6 +2560,9 @@ final class SoftwarePlaybackHost {
                 return endSeconds <= targetSeconds
             }
             let dropped = beforeCount - buffers.count
+            if !buffers.isEmpty {
+                audioSkipUntilSeconds = nil
+            }
             if dropped > 0, !loggedAudioPrerollDrop {
                 loggedAudioPrerollDrop = true
                 EngineLog.emit(
@@ -2549,11 +2596,26 @@ final class SoftwarePlaybackHost {
                     lastEnqueuedAudioPtsSec = .nan
                     rebuffering = false
                     loggedAudioPrerollDrop = false
+                    if clockArmed(), let aOut = audioOutput {
+                        audioSkipUntilSeconds = aOut.currentTimeSeconds
+                    } else {
+                        audioSkipUntilSeconds = nil
+                    }
+                    if isPlaying(), releaseVideoPrimeRateHold() {
+                        resumeClockAfterVideoPrime = true
+                        videoPrimeReadyAfter = nil
+                        videoPrimeForceResumeAfter = DispatchTime.now() + .milliseconds(Int(postSeekVideoPrimeMaxHoldMs))
+                    } else {
+                        resumeClockAfterVideoPrime = false
+                        videoPrimeReadyAfter = nil
+                        videoPrimeForceResumeAfter = nil
+                    }
                     // The lead is zero again after a seek, so the latch has to earn itself back:
                     // keeping it set pauses the clock for a rebuffer on the first post-seek check.
                     everHadLead = false
                 }
                 drainParkedVideoNonblocking()
+                maybeResumeClockAfterVideoPrime()
                 applyAudioClockAction()
                 // Read gate: stop pulling once decoded audio holds its target lead. The FIFO cap
                 // is the memory backstop, not the pacing rule - what bounds the lead has to be
