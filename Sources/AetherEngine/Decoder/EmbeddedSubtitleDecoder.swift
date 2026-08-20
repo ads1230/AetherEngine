@@ -10,6 +10,7 @@ import Libavutil
 /// Handles PGS PES-header strip, zlib/gzip Matroska compression wrappers, and PGS clear-event semantics.
 /// Not MainActor: lives on the HLSSegmentProducer pump worker queue.
 final class EmbeddedSubtitleDecoder {
+    private static let maxDVBBitmapDisplaySeconds: Double = 8.0
 
     struct SubtitleEvent: @unchecked Sendable {
         /// Empty for PGS clear events (each PGS event implicitly terminates the previous bitmap; AetherEngine applies the trim).
@@ -202,6 +203,12 @@ final class EmbeddedSubtitleDecoder {
         // only bounds a ghost line if transmission stops without either; teletext re-transmits
         // held pages every few seconds, so a real caption never hits it.
         if isTeletext, endOffset > 120 { endOffset = 120 }
+        // SD DVB services sometimes omit the final clear page and leave libavcodec reporting a
+        // long page timeout. Later DVB page updates still trim earlier cues exactly at their PTS;
+        // this only bounds a final untrimmed bitmap page.
+        if isDVBBitmap, endOffset - startOffset > Self.maxDVBBitmapDisplaySeconds {
+            endOffset = startOffset + Self.maxDVBBitmapDisplaySeconds
+        }
         let startTime: Double
         let endTime: Double
         startTime = pktPTS + startOffset
