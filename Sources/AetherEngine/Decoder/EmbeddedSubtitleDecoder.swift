@@ -200,8 +200,20 @@ final class EmbeddedSubtitleDecoder {
         if isTeletext, endOffset > 120 { endOffset = 120 }
         let startTime: Double
         let endTime: Double
-        startTime = pktPTS + startOffset
-        endTime = pktPTS + endOffset
+        if isDVBBitmap {
+            // Live DVB subtitles frequently arrive with decoder display offsets several seconds
+            // ahead of the packet PTS. Applying that full offset on a just-tuned live stream makes
+            // cues miss the active page window; using raw packet PTS makes them visibly early. Cap
+            // the offset so the page has a small presentation delay without disappearing before it
+            // becomes visible.
+            let displayDelay = min(max(startOffset, 0), 1.0)
+            let displayDuration = max(0.5, endOffset - startOffset)
+            startTime = pktPTS + displayDelay
+            endTime = startTime + displayDuration
+        } else {
+            startTime = pktPTS + startOffset
+            endTime = pktPTS + endOffset
+        }
 
         // PCS-reported canvas; fall back to source video dims if missing.
         // DVB exception: ETSI EN 300 743 defines the display as 720x576 when the stream
@@ -336,10 +348,10 @@ final class EmbeddedSubtitleDecoder {
             cues: cues,
             isPGS: isPGS,
             isDVBBitmap: isDVBBitmap,
-            // DVB bitmap events are page replacements on live broadcast streams. Apply the
-            // trim before inserting this event so same-PTS multi-object pages stay atomic, while
-            // older page states do not remain active and fight the current one in the overlay.
-            pgsTrimAt: isPGS || isDVBBitmap ? startTime : nil,
+            // DVB decoders can emit one page as several non-empty object events. Only an explicit
+            // empty page is a clear; trimming every non-empty event makes split pages erase
+            // themselves before the overlay can render them.
+            pgsTrimAt: isPGS || (isDVBBitmap && isClearEvent) ? startTime : nil,
             textTrimAt: isTeletext ? startTime : nil,
             isSelfContainedPGS: selfContained
         )
