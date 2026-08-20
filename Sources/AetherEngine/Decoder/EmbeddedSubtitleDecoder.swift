@@ -200,16 +200,8 @@ final class EmbeddedSubtitleDecoder {
         if isTeletext, endOffset > 120 { endOffset = 120 }
         let startTime: Double
         let endTime: Double
-        if isDVBBitmap {
-            // Live DVB bitmap packets are already PTS-timed for display. Applying
-            // start_display_time again makes pages appear several seconds late on HDHomeRun streams.
-            let displayDuration = max(0.1, endOffset - startOffset)
-            startTime = pktPTS
-            endTime = pktPTS + displayDuration
-        } else {
-            startTime = pktPTS + startOffset
-            endTime = pktPTS + endOffset
-        }
+        startTime = pktPTS + startOffset
+        endTime = pktPTS + endOffset
 
         // PCS-reported canvas; fall back to source video dims if missing.
         // DVB exception: ETSI EN 300 743 defines the display as 720x576 when the stream

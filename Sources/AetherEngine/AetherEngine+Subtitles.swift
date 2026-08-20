@@ -910,8 +910,6 @@ extension AetherEngine {
         }
     }
 
-    private static let liveDVBSubtitleFutureClampSeconds: Double = 4.0
-
     /// Returns what the event did to the array (#357). An event that decodes but resolves to nothing
     /// new (a re-decoded cue the store already holds, a trim matching no open window) must not cost a
     /// publication: on a dense track that is the common case, and each publication makes every
@@ -921,7 +919,6 @@ extension AetherEngine {
                                     to cues: inout [SubtitleCue],
                                     channel: SubtitleChannel) -> SubtitleDeliveryStatement.Application {
         guard isSubtitleActive(for: channel) else { return .init() }
-        let event = normalizeLiveDVBSubtitleEvent(event, playhead: sourceTime)
 
         // #357: primary-only, and budgeted per seek generation rather than per load, so a seek
         // sequence stays observable to its end. The playhead is `sourceTime`, the axis cue
@@ -941,36 +938,6 @@ extension AetherEngine {
         }
 
         return applyEventMutations(event, to: &cues, channel: channel)
-    }
-
-    private func normalizeLiveDVBSubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent,
-                                               playhead: Double) -> EmbeddedSubtitleDecoder.SubtitleEvent {
-        guard (isLive || loadedOptions.isLive), event.isDVBBitmap else { return event }
-
-        func rebased(_ cue: SubtitleCue) -> SubtitleCue {
-            let lead = cue.startTime - playhead
-            guard lead > 0, lead <= Self.liveDVBSubtitleFutureClampSeconds else { return cue }
-            let duration = max(0.1, cue.endTime - cue.startTime)
-            return cue.with(startTime: playhead, endTime: playhead + duration)
-        }
-
-        let rebasedCues = event.cues.map(rebased)
-        let rebasedTrimAt: Double?
-        if let trimAt = event.pgsTrimAt {
-            let lead = trimAt - playhead
-            rebasedTrimAt = lead > 0 && lead <= Self.liveDVBSubtitleFutureClampSeconds ? playhead : trimAt
-        } else {
-            rebasedTrimAt = nil
-        }
-
-        return EmbeddedSubtitleDecoder.SubtitleEvent(
-            cues: rebasedCues,
-            isPGS: event.isPGS,
-            isDVBBitmap: event.isDVBBitmap,
-            pgsTrimAt: rebasedTrimAt,
-            textTrimAt: event.textTrimAt,
-            isSelfContainedPGS: event.isSelfContainedPGS
-        )
     }
 
     /// PGS clear-event trim + sorted insert. Native mov_text stores (#55) are NOT fed here; those are owned by the multi-decode reader.
