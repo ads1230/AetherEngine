@@ -1167,12 +1167,23 @@ final class SoftwarePlaybackHost {
         renderer.flush(removingDisplayedImage: false)
         audioOutput?.flush()
 
-        // Publish the target and hold it across the await, so the scrub clock snaps the way the native
-        // path's optimistic publish does instead of drifting on the stale synchronizer anchor.
-        currentTime = seconds
+        let sessionTarget = max(0, seconds)
+        let sourceZero = softwareSeekSourceZero()
+        let sourceTarget = !isLive && sourceZero > 0 ? sessionTarget + sourceZero : sessionTarget
+        EngineLog.emit(
+            "[SWHost] seek map session=\(String(format: "%.3f", sessionTarget))s "
+            + "zero=\(String(format: "%.3f", sourceZero))s "
+            + "source=\(String(format: "%.3f", sourceTarget))s live=\(isLive ? "YES" : "NO")",
+            category: .swPlayback
+        )
+
+        // Publish the session target and hold it across the await, so the scrub clock snaps the way
+        // the native path's optimistic publish does instead of drifting on the stale synchronizer
+        // anchor. Demux/decoder clocks stay on the source axis below.
+        currentTime = sessionTarget
         seekInFlight = true
         let outcome = await dem.seekBounded(
-            to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
+            to: sourceTarget, timeout: Self.seekBudgetSeconds, on: seekQueue,
             isSuperseded: { [weak self] in self?.seekGeneration != generation })
         // A newer seek owns the state from here: it published its own target and clears the hold itself.
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
@@ -1181,17 +1192,17 @@ final class SoftwarePlaybackHost {
         seekInFlight = false
         if outcome == .stalled {
             EngineLog.emit(
-                "[SWHost] reposition to \(String(format: "%.2f", seconds))s did not complete within "
+                "[SWHost] reposition to \(String(format: "%.2f", sourceTarget))s did not complete within "
                 + "\(String(format: "%.0f", Self.seekBudgetSeconds))s; read position is undefined",
                 category: .swPlayback
             )
         }
 
-        let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
+        let targetTime = CMTime(seconds: sourceTarget, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
 
-        currentTime = seconds
+        currentTime = sessionTarget
 
         // #292: the intent is read HERE, not from what this seek captured on entry. `pause()` / `play()`
         // during the reposition rewrite the stash, and a landing that ignored them either overrode the
@@ -1208,6 +1219,16 @@ final class SoftwarePlaybackHost {
         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
         clockArmed = true
         return outcome
+    }
+
+    private func softwareSeekSourceZero() -> Double {
+        guard !isLive else { return 0 }
+        let storedZero = clockSessionZero
+        if storedZero > 0 {
+            return storedZero
+        }
+        let publishedZero = sourceClockSeconds - currentTime
+        return publishedZero.isFinite && publishedZero > 0 ? publishedZero : 0
     }
 
     /// Live DVR rewind: reseeds decoder from the ring (source PTS axis; maps via sessionStartPts) without touching the live demuxer. After return, the loop reads new packets forward and plays back to live.
