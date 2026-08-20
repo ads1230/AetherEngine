@@ -179,6 +179,7 @@ final class EmbeddedSubtitleDecoder {
         }
 
         let isTeletext = ctx.pointee.codec_id == AV_CODEC_ID_DVB_TELETEXT
+        let isDVBBitmap = ctx.pointee.codec_id == AV_CODEC_ID_DVB_SUBTITLE
         let tbSec = Double(streamTimeBase.num) / Double(streamTimeBase.den)
         let rawPTS = packet.pointee.pts
         let pktPTS = (rawPTS == Int64.min) ? 0 : Double(rawPTS) * tbSec
@@ -196,8 +197,18 @@ final class EmbeddedSubtitleDecoder {
         // only bounds a ghost line if transmission stops without either; teletext re-transmits
         // held pages every few seconds, so a real caption never hits it.
         if isTeletext, endOffset > 120 { endOffset = 120 }
-        let startTime = pktPTS + startOffset
-        let endTime = pktPTS + endOffset
+        let startTime: Double
+        let endTime: Double
+        if isDVBBitmap {
+            // Live DVB bitmap packets are already PTS-timed for display. Applying
+            // start_display_time again makes pages appear several seconds late on HDHomeRun streams.
+            let displayDuration = max(0.1, endOffset - startOffset)
+            startTime = pktPTS
+            endTime = pktPTS + displayDuration
+        } else {
+            startTime = pktPTS + startOffset
+            endTime = pktPTS + endOffset
+        }
 
         // PCS-reported canvas; fall back to source video dims if missing.
         // DVB exception: ETSI EN 300 743 defines the display as 720x576 when the stream
@@ -208,7 +219,6 @@ final class EmbeddedSubtitleDecoder {
         // reports 704x576 while DVB rects are authored on the 720-wide grid. A wrong
         // canvas skews every normalized cue position (bottom-centred rows rendered
         // mid-left at 1920x1080).
-        let isDVBBitmap = ctx.pointee.codec_id == AV_CODEC_ID_DVB_SUBTITLE
         let canvasW = ctx.pointee.width > 0 ? ctx.pointee.width : (isDVBBitmap ? 720 : sourceVideoWidth)
         let canvasH = ctx.pointee.height > 0 ? ctx.pointee.height : (isDVBBitmap ? 576 : sourceVideoHeight)
 
