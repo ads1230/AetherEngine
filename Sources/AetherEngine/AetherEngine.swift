@@ -3454,11 +3454,19 @@ public final class AetherEngine: ObservableObject {
         // HEVC channel on the same provider stays on the hardware-decoded native path.
         // The software host itself can now select a VT-backed H.264 decoder, so HD live
         // can keep fast-zap startup without paying libavcodec's steady-state 1080 cost.
+        // UNRESOLVED dims (0x0) qualify on a LIVE source: a zap-friendly probe
+        // budget routinely ends before the first H.264 IDR resolves them, the
+        // software decoder latches dimensions from frames exactly as it does
+        // for MPEG-2, and gating on resolved dims forced hosts into a long
+        // re-probe (≥1.5s per join) purely to unlock this preference. A live
+        // H.264 channel above 1080p is not a real broadcast shape (UHD is
+        // HEVC), so the unknown-dims case stays a comfortable CPU trade.
         if options.preferSoftwareVideoRoute, !useSoftwarePath,
            detectedCodecID == AV_CODEC_ID_H264,
            let vStream = probe.stream(at: probe.videoStreamIndex),
            let codecpar = vStream.pointee.codecpar,
-           codecpar.pointee.height > 0, codecpar.pointee.height <= 1080 {
+           (codecpar.pointee.height > 0 && codecpar.pointee.height <= 1080)
+               || (codecpar.pointee.height == 0 && options.isLive) {
             useSoftwarePath = true
             EngineLog.emit(
                 "[AetherEngine] host preference: software video route "

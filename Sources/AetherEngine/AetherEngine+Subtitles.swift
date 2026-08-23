@@ -1182,6 +1182,29 @@ extension AetherEngine {
                     return true
                 }
             }
+            // DVB re-transmits an unchanged page every ~0.5-2s with a FRESH
+            // PTS, so the same-start replace above never sees a re-send and
+            // the retained store grew one copy per repetition (55+ live cues
+            // for a single held SD page). A geometry-identical image cue
+            // whose window is still OPEN at the newcomer's start IS the same
+            // on-air page: replace it, keeping the newcomer's image and
+            // refreshed window. The window-overlap requirement keeps a later
+            // genuine recurrence (same spot, closed window) a separate cue.
+            // Backward scan bounded by the widest bitmap window the decoder
+            // emits (~30s open-ended DVB placeholder).
+            var i = lower - 1
+            while i >= 0, cues[i].startTime > stamped.startTime - 40 {
+                defer { i -= 1 }
+                guard case .image(let otherImage) = cues[i].body,
+                      cues[i].endTime >= stamped.startTime,
+                      otherImage.position == stampedImage.position,
+                      otherImage.canvasSize == stampedImage.canvasSize,
+                      otherImage.cgImage.width == stampedImage.cgImage.width,
+                      otherImage.cgImage.height == stampedImage.cgImage.height else { continue }
+                cues.remove(at: i)
+                cues.insert(stamped, at: lowerBoundByStartTime(stamped.startTime, in: cues))
+                return true
+            }
         }
         cues.insert(stamped, at: lower)
         return true
