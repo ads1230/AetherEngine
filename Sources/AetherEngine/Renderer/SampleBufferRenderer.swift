@@ -40,6 +40,77 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private var reorderBuffer: [(CVPixelBuffer, CMTime, Data?)] = []
     private let reorderDepth = 4  // handles up to 3 consecutive B-frames
 
+    // MARK: - Decoded-frame cushion (VLC-style)
+    //
+    // The display layer's internal queue (~10 frames, ~0.2s at 50fps) used to be
+    // the ONLY decoded buffer on the software path, so any decode/scheduling
+    // transient beyond 0.2s dropped frames — field-measured 1-2 drops/s on
+    // CPU-decoded 1080i50 DVB while VLC (same libavcodec decode, ~1s decoded
+    // picture pool) plays the same stream clean. The reorder buffer now doubles
+    // as that pool: frames accumulate here up to `cushionTargetFrames`, and a
+    // demand pump trickles them to the layer while it reports ready. A 50ms
+    // timer keeps the layer fed from the cushion when decode stalls — which is
+    // the entire point of the cushion. `cushionCapFrames` is the memory bound
+    // (1080p NV12 ≈ 3.1MB/frame): beyond it the oldest frame force-flushes to
+    // the layer exactly like the old overflow rule.
+    #if os(macOS)
+    private let cushionTargetFrames = 32   // ~1.3s @25fps, ~0.6s @50fps, ≈100MB worst case
+    private let cushionCapFrames = 48
+    #else
+    private let cushionTargetFrames = 12   // Apple TV / iPhone memory headroom
+    private let cushionCapFrames = 20
+    #endif
+    private var feederTimer: DispatchSourceTimer?
+    private let feederQueue = DispatchQueue(label: "aether.renderer.cushion-feeder", qos: .userInteractive)
+
+    /// Demux-loop decode gate: keep decoding while the cushion is below target.
+    /// Replaces raw layer readiness as the back-pressure signal — the layer
+    /// going momentarily unready must not stall decode when the cushion has
+    /// room, or the cushion can never fill past the layer's own tiny queue.
+    var wantsMoreDecodedFrames: Bool {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return reorderBuffer.count < cushionTargetFrames
+    }
+
+    /// Release cushioned frames to the layer while it will take them, always
+    /// keeping `reorderDepth` frames back so late-arriving B-frames can still
+    /// be sorted into place. Safe from any thread (reorderLock + the layer's
+    /// own internal locking); called from enqueue() and the feeder timer.
+    private func pumpCushion() {
+        while true {
+            reorderLock.lock()
+            guard reorderBuffer.count > reorderDepth, queueTarget.isReadyForMoreMediaData else {
+                reorderLock.unlock()
+                return
+            }
+            let (pb, t, hdr) = reorderBuffer.removeFirst()
+            reorderLock.unlock()
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+        }
+    }
+
+    private func startCushionFeederIfNeeded() {
+        reorderLock.lock()
+        let needsStart = feederTimer == nil
+        reorderLock.unlock()
+        guard needsStart else { return }
+        let timer = DispatchSource.makeTimerSource(queue: feederQueue)
+        timer.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(50), leeway: .milliseconds(10))
+        timer.setEventHandler { [weak self] in
+            self?.pumpCushion()
+        }
+        reorderLock.lock()
+        if feederTimer == nil {
+            feederTimer = timer
+            reorderLock.unlock()
+            timer.resume()
+        } else {
+            reorderLock.unlock()
+            timer.cancel()
+        }
+    }
+
     /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
     private var skipUntilPTS: CMTime?
 
@@ -305,7 +376,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }) ?? reorderBuffer.endIndex
         reorderBuffer.insert((pixelBuffer, pts, hdr10PlusData), at: insertIdx)
 
-        while reorderBuffer.count > reorderDepth {
+        // Memory bound only: within the cap, frames REST here as the decoded
+        // cushion; the demand pump below (and the feeder timer) release them
+        // as the layer asks.
+        while reorderBuffer.count > cushionCapFrames {
             let (pb, t, hdr) = reorderBuffer.removeFirst()
             reorderLock.unlock()
             flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
@@ -313,6 +387,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         reorderLock.unlock()
+        startCushionFeederIfNeeded()
+        pumpCushion()
     }
 
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible

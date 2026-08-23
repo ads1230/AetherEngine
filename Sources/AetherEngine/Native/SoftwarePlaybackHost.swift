@@ -2103,7 +2103,7 @@ final class SoftwarePlaybackHost {
                 // if the packet is already due soon, enqueue it or the clock will
                 // outrun live video and the layer will drop a late burst.
                 var waitTicks = 0
-                while !renderer.isReadyForMoreMediaData && !stopRequested() && isPlaying()
+                while !renderer.wantsMoreDecodedFrames && !stopRequested() && isPlaying()
                         && !seekSuperseded(generation) {
                     if clockArmed() { break }
                     var shouldWait = true
@@ -2386,7 +2386,7 @@ final class SoftwarePlaybackHost {
         func drainParkedVideoNonblocking() {
             if seekGeneration() != parkedSeekGeneration { return }
             while let head = parkedVideo.first, !stopRequested(), !backgroundAudioOnly() {
-                if !renderer.isReadyForMoreMediaData {
+                if !renderer.wantsMoreDecodedFrames {
                     // The iOS 18+ sampleBufferRenderer readiness flag is
                     // just-in-time pacing, not queue capacity. This drain is
                     // polled once per demux iteration, and iterations grow
@@ -2777,7 +2777,7 @@ final class SoftwarePlaybackHost {
                     return true
                 }
                 // Back-pressure via SampleBufferRenderer.isReadyForMoreMediaData (not the deprecated layer property). Park on condition while paused to avoid 200 Hz CPU spin.
-                while !renderer.isReadyForMoreMediaData && !stopRequested() && !backgroundAudioOnly() {
+                while !renderer.wantsMoreDecodedFrames && !stopRequested() && !backgroundAudioOnly() {
                     autoreleasepool {
                         if !isPlaying() {
                             condition.lock()
