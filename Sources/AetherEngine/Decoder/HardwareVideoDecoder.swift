@@ -49,6 +49,13 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     private var session: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
+    /// Creation inputs retained for session recreation: iOS invalidates every
+    /// hardware VT session when the app backgrounds without an active PiP
+    /// window (kVTInvalidSessionErr on each subsequent decode). The session
+    /// must be rebuilt — the old one never recovers (guarded by `lock`).
+    private var decoderSpecification: NSDictionary?
+    private var pixelBufferAttributes: NSDictionary?
+    private var sessionInvalidated = false
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     private var codecType: CMVideoCodecType = kCMVideoCodecType_HEVC
     private var samplesNeedAnnexBConversion = false
@@ -225,6 +232,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.sessionCreationFailed(status: status)
         }
         session = createdSession
+        decoderSpecification = decoderSpec
+        pixelBufferAttributes = pixelBufferAttrs
+        sessionInvalidated = false
 
         // 5. Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
         if #available(tvOS 17.0, iOS 17.0, *) {
@@ -247,7 +257,21 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // MARK: - Decode
 
     func decode(packet: UnsafeMutablePointer<AVPacket>) {
+        let isKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
         lock.lock()
+        if sessionInvalidated {
+            // The OS tore the session down underneath us; inter frames would
+            // only reference pictures the replacement session has never seen,
+            // so drop everything until a keyframe, then rebuild there. While
+            // the app is still backgrounded the rebuild (or its first decode)
+            // fails again and the flag re-arms — recovery lands on the first
+            // keyframe after foregrounding.
+            guard isKeyframe, recreateSessionLocked() else {
+                lock.unlock()
+                return
+            }
+            sessionInvalidated = false
+        }
         guard let session = session, let formatDesc = formatDescription else {
             lock.unlock()
             return
@@ -356,12 +380,61 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             frameRefcon: nil,
             infoFlagsOut: &infoFlags
         )
-        if decodeStatus != noErr {
+        if decodeStatus == kVTInvalidSessionErr {
+            lock.lock()
+            let firstHit = !sessionInvalidated
+            sessionInvalidated = true
+            lock.unlock()
+            if firstHit {
+                EngineLog.emit(
+                    "[HardwareVideoDecoder] VT session invalidated (-12903) at pts=\(ptsRaw); recreating at next keyframe",
+                    category: .swPlayback
+                )
+            }
+        } else if decodeStatus != noErr {
             EngineLog.emit(
                 "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(ptsRaw)",
                 category: .swPlayback
             )
         }
+    }
+
+    /// Rebuilds the VTDecompressionSession from the retained creation inputs.
+    /// Caller holds `lock` and is positioned at a keyframe. Returns false when
+    /// creation is denied (typically: still backgrounded), leaving the
+    /// invalidated flag armed for a retry at a later keyframe.
+    private func recreateSessionLocked() -> Bool {
+        guard let formatDesc = formatDescription, let box = refConBox else { return false }
+        if let old = session {
+            VTDecompressionSessionInvalidate(old)
+            session = nil
+        }
+        var callback = VTDecompressionOutputCallbackRecord(
+            decompressionOutputCallback: hwDecoderOutputCallback,
+            decompressionOutputRefCon: box.toOpaque()
+        )
+        var sessionOut: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: formatDesc,
+            decoderSpecification: decoderSpecification,
+            imageBufferAttributes: pixelBufferAttributes,
+            outputCallback: &callback,
+            decompressionSessionOut: &sessionOut
+        )
+        guard status == noErr, let created = sessionOut else {
+            return false
+        }
+        if #available(tvOS 17.0, iOS 17.0, *) {
+            VTSessionSetProperty(
+                created,
+                key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+                value: kCFBooleanTrue
+            )
+        }
+        session = created
+        EngineLog.emit("[HardwareVideoDecoder] VT session recreated after invalidation", category: .swPlayback)
+        return true
     }
 
     func flush() {
