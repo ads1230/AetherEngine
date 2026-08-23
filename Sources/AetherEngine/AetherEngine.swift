@@ -558,6 +558,16 @@ public final class AetherEngine: ObservableObject {
             // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
             // window and never double-draw under the fullscreen host overlay.
             softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive)
+            #if os(iOS)
+            // Auto-PiP ordering isn't guaranteed: didEnterBackground can run
+            // before AVKit's willStart, shedding video for a PiP window that
+            // is about to present — a frozen picture with running audio.
+            // Un-shed the moment PiP arrives (only touches the background
+            // shed; a host-requested tab shed is a separate flag).
+            if pictureInPictureActive && !oldValue && isBackgrounded {
+                softwareHost?.exitBackgroundAudioOnly()
+            }
+            #endif
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the
             // wedge-safe teardown now, before idle suspension (mirrors the iOS pause-while-backgrounded path).
