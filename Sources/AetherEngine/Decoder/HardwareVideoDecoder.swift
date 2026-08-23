@@ -56,6 +56,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var decoderSpecification: NSDictionary?
     private var pixelBufferAttributes: NSDictionary?
     private var sessionInvalidated = false
+    /// Consecutive failed recreation attempts (guarded by `lock`). Field logs
+    /// showed 15s of silent create failures in the FOREGROUND after a channel
+    /// switch — after enough hardware denials the requirement is dropped so a
+    /// VT software session can carry the picture instead of a black layer.
+    private var recreateFailures = 0
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     private var codecType: CMVideoCodecType = kCMVideoCodecType_HEVC
     private var samplesNeedAnnexBConversion = false
@@ -413,16 +418,28 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             decompressionOutputCallback: hwDecoderOutputCallback,
             decompressionOutputRefCon: box.toOpaque()
         )
+        // After three consecutive hardware denials, retry without the
+        // hardware-required specification: a VT software session still beats
+        // a permanently black layer, and 720p live H.264 decodes fine on CPU.
+        let spec: NSDictionary? = recreateFailures >= 3 ? nil : decoderSpecification
         var sessionOut: VTDecompressionSession?
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: formatDesc,
-            decoderSpecification: decoderSpecification,
+            decoderSpecification: spec,
             imageBufferAttributes: pixelBufferAttributes,
             outputCallback: &callback,
             decompressionSessionOut: &sessionOut
         )
         guard status == noErr, let created = sessionOut else {
+            recreateFailures += 1
+            if recreateFailures <= 4 || recreateFailures % 25 == 0 {
+                EngineLog.emit(
+                    "[HardwareVideoDecoder] session recreate failed status=\(status) attempt=\(recreateFailures)"
+                    + "\(spec == nil ? " (software spec)" : "")",
+                    category: .swPlayback
+                )
+            }
             return false
         }
         if #available(tvOS 17.0, iOS 17.0, *) {
@@ -433,7 +450,12 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
         session = created
-        EngineLog.emit("[HardwareVideoDecoder] VT session recreated after invalidation", category: .swPlayback)
+        EngineLog.emit(
+            "[HardwareVideoDecoder] VT session recreated after invalidation"
+            + "\(spec == nil ? " (software spec)" : "") attempts=\(recreateFailures + 1)",
+            category: .swPlayback
+        )
+        recreateFailures = 0
         return true
     }
 
@@ -450,6 +472,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     func close() {
         lock.lock()
         if let session = session {
+            // Timestamped so field logs can correlate the OLD decoder's
+            // teardown with the -12903 the NEW channel's session takes ~2s
+            // after a switch (cause still unproven).
+            EngineLog.emit("[HardwareVideoDecoder] close \(width)x\(height)", category: .swPlayback)
             VTDecompressionSessionWaitForAsynchronousFrames(session)
             VTDecompressionSessionInvalidate(session)
             self.session = nil
