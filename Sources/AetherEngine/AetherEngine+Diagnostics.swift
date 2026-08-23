@@ -119,8 +119,17 @@ extension AetherEngine {
                     vmStr = ""
                 }
 
+                // Census-gated: malloc_zone_statistics(nil,...) walks EVERY zone
+                // with the zone locks held. At 1M+ live blocks that stalls every
+                // allocating thread for long enough that libavcodec's decode
+                // threads miss frame deadlines — field-traced as a layerDrop
+                // burst on the 30s memprobe tick, i.e. a visible stutter every
+                // 30s on CPU-decoded live video (2026-08-23; VT sessions were
+                // immune, which is what gave it away). The cheap task_info
+                // numbers above cover routine monitoring; the malloc walk is
+                // for leak hunts that opt into the census.
                 let mallocStr: String
-                if let m = Self.mallocZoneSummary() {
+                if MallocBlockCensus.isEnabled, let m = Self.mallocZoneSummary() {
                     mallocStr = "mallocBlocks=\(m.blocksInUse) mallocMB=\(m.sizeInUseMB) "
                 } else {
                     mallocStr = ""
