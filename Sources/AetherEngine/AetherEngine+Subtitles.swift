@@ -1187,11 +1187,17 @@ extension AetherEngine {
             // the retained store grew one copy per repetition (55+ live cues
             // for a single held SD page). A geometry-identical image cue
             // whose window is still OPEN at the newcomer's start IS the same
-            // on-air page: replace it, keeping the newcomer's image and
-            // refreshed window. The window-overlap requirement keeps a later
-            // genuine recurrence (same spot, closed window) a separate cue.
-            // Backward scan bounded by the widest bitmap window the decoder
-            // emits (~30s open-ended DVB placeholder).
+            // on-air page: KEEP the retained cue — its id, image and start
+            // are the page's stable identity — and only extend its window to
+            // the newcomer's. Swapping in the newcomer's cue instead handed
+            // hosts a fresh id + CGImage every re-send, and a SwiftUI overlay
+            // keyed on cue id rebuilt the subtitle image view at ~2Hz over
+            // the video layer — measured 2-4 dropped frames/s, i.e. visible
+            // judder, whenever a page was on screen (2026-08-23 field log).
+            // The window-overlap requirement keeps a later genuine recurrence
+            // (same spot, closed window) a separate cue. Backward scan
+            // bounded by the widest bitmap window the decoder emits (~30s
+            // open-ended DVB placeholder).
             var i = lower - 1
             while i >= 0, cues[i].startTime > stamped.startTime - 40 {
                 defer { i -= 1 }
@@ -1201,8 +1207,9 @@ extension AetherEngine {
                       otherImage.canvasSize == stampedImage.canvasSize,
                       otherImage.cgImage.width == stampedImage.cgImage.width,
                       otherImage.cgImage.height == stampedImage.cgImage.height else { continue }
-                cues.remove(at: i)
-                cues.insert(stamped, at: lowerBoundByStartTime(stamped.startTime, in: cues))
+                if stamped.endTime > cues[i].endTime {
+                    cues[i] = cues[i].with(endTime: stamped.endTime)
+                }
                 return true
             }
         }
