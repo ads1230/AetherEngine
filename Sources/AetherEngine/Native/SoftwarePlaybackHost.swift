@@ -2947,9 +2947,30 @@ final class SoftwarePlaybackHost {
             return true
         }
 
+        // Stall probe: the parked-video drain runs once per iteration, and the
+        // layer's ~10-frame queue absorbs at most ~400ms at 25fps — a slower
+        // iteration delivers frames late in a burst the layer discards (the
+        // 2026-08-23 "occasional glitch" report: +4..+7 layerDrop bursts with
+        // healthy buffers). Log slow iterations so a field log names the
+        // stall instead of the symptom. Budgeted: silent after 40 lines.
+        var slowIterationLogBudget = 40
         while !stopRequested() {
+            let iterationStart = DispatchTime.now()
             let keepGoing: Bool = autoreleasepool {
                 demuxIteration()
+            }
+            if slowIterationLogBudget > 0, isPlaying() {
+                let iterationMs = Double(DispatchTime.now().uptimeNanoseconds
+                    - iterationStart.uptimeNanoseconds) / 1e6
+                if iterationMs > 120 {
+                    slowIterationLogBudget -= 1
+                    EngineLog.emit(
+                        "[SWHost] slow demux iteration \(Int(iterationMs))ms "
+                        + "(parked=\(parkedVideo.count) rebuffering=\(rebuffering) "
+                        + "budget=\(slowIterationLogBudget))",
+                        category: .swPlayback
+                    )
+                }
             }
             diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
                          parked: parkedVideo.count,
