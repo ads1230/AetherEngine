@@ -56,8 +56,14 @@ final class SampleBufferRenderer: @unchecked Sendable {
     #if os(macOS)
     private let cushionTargetFrames = 32   // ~1.3s @25fps, ~0.6s @50fps, ≈100MB worst case
     private let cushionCapFrames = 48
+    #elseif os(tvOS)
+    // Apple TV 4K has 3-4GB and no phone-grade jetsam pressure, and its live
+    // tuner channels ALWAYS take the software route (the app forces it so
+    // 1080i gets deinterlaced) — it needs the full cushion as much as the Mac.
+    private let cushionTargetFrames = 24   // ~1.0s @25fps, ≈75MB worst case at cap
+    private let cushionCapFrames = 36
     #else
-    private let cushionTargetFrames = 12   // Apple TV / iPhone memory headroom
+    private let cushionTargetFrames = 12   // iPhone/iPad memory headroom
     private let cushionCapFrames = 20
     #endif
     private var feederTimer: DispatchSourceTimer?
