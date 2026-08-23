@@ -31,6 +31,17 @@ public final class AetherPlayerView: PlatformBaseView {
 
     private var hostedLayer: CALayer?
 
+    #if canImport(AppKit)
+    /// Owns the hosted layer as its backing layer. AVKit's sample-buffer PiP
+    /// replaces the source layer's owning view with a private bridge view
+    /// added to that view's SUPERVIEW — backing this view directly parked the
+    /// bridge inside NSHostingView, which SwiftUI rejects ("Adding
+    /// 'AVPictureInPicturePlayerLayerView' as a subview of
+    /// NSHostingController.view is not supported"). With an inner child the
+    /// bridge lands in this plain NSView instead.
+    private let layerHostView = NSView()
+    #endif
+
     #if canImport(UIKit)
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -59,6 +70,11 @@ public final class AetherPlayerView: PlatformBaseView {
         #elseif canImport(AppKit)
         wantsLayer = true
         layer?.backgroundColor = CGColor.black
+        layerHostView.wantsLayer = true
+        layerHostView.layer?.backgroundColor = CGColor.black
+        layerHostView.frame = bounds
+        layerHostView.autoresizingMask = [.width, .height]
+        addSubview(layerHostView)
         #endif
     }
 
@@ -81,8 +97,9 @@ public final class AetherPlayerView: PlatformBaseView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         #if canImport(AppKit)
-        if hosted === layer {
-            hosted.bounds = bounds
+        layerHostView.frame = bounds
+        if hosted === layerHostView.layer {
+            hosted.bounds = layerHostView.bounds
         } else {
             hosted.frame = bounds
         }
@@ -105,19 +122,18 @@ public final class AetherPlayerView: PlatformBaseView {
         hostedLayer?.removeFromSuperlayer()
         #if canImport(UIKit)
         self.layer.addSublayer(layer)
+        layer.frame = bounds
         #elseif canImport(AppKit)
         // macOS PiP's sample-buffer path expects the source layer to be owned
-        // by a real NSView. Hosting it only as a sublayer lets AVKit attach its
-        // private PiP bridge view to NSHostingController.view, which SwiftUI
-        // warns is an unsupported hierarchy.
-        self.layer = layer
+        // by a real NSView — and NOT by this view itself: AVKit inserts its
+        // PiP bridge view into the owning view's superview, so the owner must
+        // sit below a plain NSView (see layerHostView).
+        layerHostView.frame = bounds
+        layerHostView.layer = layer
+        layerHostView.wantsLayer = true
         layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        layer.bounds = layerHostView.bounds
         #endif
-        if layer === self.layer {
-            layer.bounds = bounds
-        } else {
-            layer.frame = bounds
-        }
         hostedLayer = layer
         CATransaction.commit()
     }
@@ -129,10 +145,10 @@ public final class AetherPlayerView: PlatformBaseView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         #if canImport(AppKit)
-        if hosted === layer {
+        if hosted === layerHostView.layer {
             let blankLayer = CALayer()
             blankLayer.backgroundColor = CGColor.black
-            layer = blankLayer
+            layerHostView.layer = blankLayer
         } else {
             hosted.removeFromSuperlayer()
         }
