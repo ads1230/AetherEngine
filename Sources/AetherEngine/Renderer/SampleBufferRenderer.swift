@@ -400,6 +400,20 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
     /// frame; `false` (seek) holds the last frame on screen until the post-seek frame is enqueued, so a seek
     /// doesn't flash black between the old and new positions (matches the hardware path's hold-last-frame).
+    /// PiP handoff recovery: backgrounding interrupts the layer's display
+    /// pipeline (`requiresFlushToResumeDecoding`) and AVKit's PiP window then
+    /// swaps in a layer that renders BLACK until it is flushed — the 2-3
+    /// black frames on every auto-PiP start (120fps field capture
+    /// 2026-08-24; foreground manual starts never show it because the app
+    /// never backgrounds). Flush only when the OS flagged the interruption,
+    /// then pump so the cushion re-primes the window immediately.
+    func recoverFromDisplayInterruptionIfNeeded() {
+        guard displayLayer.requiresFlushToResumeDecoding else { return }
+        EngineLog.emit("[Renderer] display pipeline interrupted; flushing to resume for PiP", category: .swPlayback)
+        flush(removingDisplayedImage: false)
+        pumpCushion()
+    }
+
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
