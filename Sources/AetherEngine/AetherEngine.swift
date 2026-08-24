@@ -567,12 +567,6 @@ public final class AetherEngine: ObservableObject {
             if pictureInPictureActive && !oldValue && isBackgrounded {
                 softwareHost?.exitBackgroundAudioOnly()
             }
-            // The backgrounding that accompanies auto-PiP interrupts the
-            // display layer's pipeline; recover it the moment PiP claims the
-            // layer so the window never swaps in a black surface.
-            if pictureInPictureActive && !oldValue {
-                softwareHost?.recoverDisplayForPiP()
-            }
             #endif
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the

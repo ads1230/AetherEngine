@@ -93,13 +93,6 @@ final class SoftwarePlaybackHost {
     var displayLayer: AVSampleBufferDisplayLayer { renderer.displayLayer }
 
     /// SW-PiP Phase C: engine-fed cue mirror + PiP gate for the renderer's frame compositor.
-    /// PiP handoff: flush-and-reprime the display layer if backgrounding
-    /// interrupted it (requiresFlushToResumeDecoding) so the PiP window never
-    /// swaps in a black surface.
-    func recoverDisplayForPiP() {
-        renderer.recoverFromDisplayInterruptionIfNeeded()
-    }
-
     func updateSubtitleCompositor(cues: [SubtitleCue], enabled: Bool) {
         renderer.subtitleCompositor.update(cues: cues, enabled: enabled)
     }
