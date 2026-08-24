@@ -2561,6 +2561,10 @@ public final class AetherEngine: ObservableObject {
     /// process as a long-form audio client, which pins AVKit's
     /// `AVPictureInPictureController.isPictureInPicturePossible` to false for any host-built PiP
     /// controller around the engine's player layer, so iOS declares `.default`.
+    /// iOS: the category is set once per process (see init) — re-setting it
+    /// per engine churned route arbitration on the active session.
+    nonisolated(unsafe) static var didConfigureIOSAudioSessionCategory = false
+
     #if os(tvOS)
     nonisolated static let audioSessionRouteSharingPolicy: AVAudioSession.RouteSharingPolicy = .longFormAudio
     #else
@@ -2587,9 +2591,29 @@ public final class AetherEngine: ObservableObject {
         audioSessionCategoryTask = Task.detached(priority: .userInitiated) {
             let session = AVAudioSession.sharedInstance()
             do {
+                #if os(tvOS)
                 try session.setCategory(.playback, mode: .moviePlayback, policy: AetherEngine.audioSessionRouteSharingPolicy)
                 try session.setSupportsMultichannelContent(true)
                 EngineLog.emit("[AetherEngine] AVAudioSession: category set off-main, not activated (AVKit drives activation) policy=\(AetherEngine.audioSessionRouteSharingPolicy.rawValue) maxChannels=\(session.maximumOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
+                #else
+                // iOS: probe-clean session hygiene (2026-08-24 interruption
+                // hunt). Plain category, set ONCE per process — every engine
+                // (= every channel load) used to re-set it with a policy and
+                // setSupportsMultichannelContent(true) on the already-active
+                // session. Declaring multichannel/spatial content on iPhone
+                // enrolls the session in spatial-audio route management,
+                // whose background re-evaluation fires the spurious reason=4
+                // routeDisconnected ~5-10s after backgrounding with PiP and
+                // blanks the PiP scene. A ten-experiment probe app running
+                // the engine's entire pipeline WITHOUT this call never
+                // receives the interruption. tvOS keeps the declaration for
+                // HDMI Atmos negotiation (#24).
+                if !AetherEngine.didConfigureIOSAudioSessionCategory {
+                    AetherEngine.didConfigureIOSAudioSessionCategory = true
+                    try session.setCategory(.playback, mode: .moviePlayback)
+                    EngineLog.emit("[AetherEngine] AVAudioSession: category set once (probe-clean hygiene) maxChannels=\(session.maximumOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
+                }
+                #endif
             } catch {
                 EngineLog.emit("[AetherEngine] AVAudioSession setup error: \(error)", category: .engine)
             }
