@@ -438,6 +438,21 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
     /// frame; `false` (seek) holds the last frame on screen until the post-seek frame is enqueued, so a seek
     /// doesn't flash black between the old and new positions (matches the hardware path's hold-last-frame).
+    /// Interruption recovery, called ONLY after a real session interruption
+    /// (the spurious PiP routeDisconnected): iOS interrupts the layer's
+    /// display pipeline alongside the audio session and the window renders
+    /// black until the layer is flushed. Flushing at PiP START was wrong and
+    /// reverted (it cleared a healthy picture: on iOS 18+ the renderer arm's
+    /// flush discards the displayed image) — here the picture is already
+    /// dead, and the paced display-immediately refill from the handoff
+    /// window repaints within ~40ms.
+    func recoverFromDisplayInterruptionIfNeeded() {
+        guard displayLayer.requiresFlushToResumeDecoding else { return }
+        EngineLog.emit("[Renderer] layer pipeline interrupted; flush + immediate refill", category: .swPlayback)
+        flush(removingDisplayedImage: false)
+        pumpCushion()
+    }
+
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()

@@ -5588,6 +5588,11 @@ public final class AetherEngine: ObservableObject {
                                 self.softwareHost?.beginPiPHandoffWindow()
                             }
                             self.play()
+                            // The interruption killed the layer's display
+                            // pipeline too (requiresFlushToResumeDecoding);
+                            // without a flush the PiP window stays black no
+                            // matter what the clock does.
+                            self.softwareHost?.recoverDisplayAfterInterruption()
                         } else {
                             self.rendererAudioSessionInterrupted = true
                             self.activeTransportHost?.pause()

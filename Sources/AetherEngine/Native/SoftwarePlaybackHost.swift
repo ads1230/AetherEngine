@@ -98,6 +98,11 @@ final class SoftwarePlaybackHost {
         renderer.beginPiPHandoffWindow()
     }
 
+    /// Post-interruption layer recovery — see SampleBufferRenderer.
+    func recoverDisplayAfterInterruption() {
+        renderer.recoverFromDisplayInterruptionIfNeeded()
+    }
+
     func updateSubtitleCompositor(cues: [SubtitleCue], enabled: Bool) {
         renderer.subtitleCompositor.update(cues: cues, enabled: enabled)
     }
