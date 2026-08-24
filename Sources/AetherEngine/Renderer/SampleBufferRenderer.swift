@@ -85,10 +85,21 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// own internal locking); called from enqueue() and the feeder timer.
     private func pumpCushion() {
         while true {
+            let now = CFAbsoluteTimeGetCurrent()
             reorderLock.lock()
             guard reorderBuffer.count > reorderDepth, queueTarget.isReadyForMoreMediaData else {
                 reorderLock.unlock()
                 return
+            }
+            // Handoff window: display-immediately frames present as soon as
+            // they are dequeued, so releases must be paced by wall clock or
+            // the whole cushion bursts as fast-forward. One frame per 40ms.
+            if handoffWindowActive(now) {
+                if now - lastHandoffRelease < 0.04 {
+                    reorderLock.unlock()
+                    return
+                }
+                lastHandoffRelease = now
             }
             let (pb, t, hdr) = reorderBuffer.removeFirst()
             reorderLock.unlock()
@@ -115,6 +126,30 @@ final class SampleBufferRenderer: @unchecked Sendable {
             reorderLock.unlock()
             timer.cancel()
         }
+    }
+
+    /// Experiment: PiP handoff window (suspect #1, the render synchronizer).
+    /// While AVKit re-hosts the layer into the PiP scene the synchronizer's
+    /// media-server clock can stall, starving the layer for 2-3 frames (the
+    /// auto-PiP black flash; the probe app, which presents display-immediately
+    /// with no synchronizer, is clean). For a few seconds around PiP start,
+    /// mark outgoing frames display-immediately so the layer presents them
+    /// regardless of the clock, and pace releases by wall clock so the
+    /// cushion cannot burst. All guarded by reorderLock.
+    private var pipHandoffDeadline: CFAbsoluteTime = 0
+    private var lastHandoffRelease: CFAbsoluteTime = 0
+
+    func beginPiPHandoffWindow(seconds: Double = 3.0) {
+        reorderLock.lock()
+        pipHandoffDeadline = CFAbsoluteTimeGetCurrent() + seconds
+        lastHandoffRelease = 0
+        reorderLock.unlock()
+        EngineLog.emit("[Renderer] PiP handoff window: display-immediately for \(seconds)s", category: .swPlayback)
+    }
+
+    /// True while the handoff window is open. Lock held by caller or not required (single read).
+    private func handoffWindowActive(_ now: CFAbsoluteTime) -> Bool {
+        now < pipHandoffDeadline
     }
 
     /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
@@ -459,6 +494,19 @@ final class SampleBufferRenderer: @unchecked Sendable {
             if hdr10PlusAttachedCount == 1 || hdr10PlusAttachedCount == 30 || hdr10PlusAttachedCount % 600 == 0 {
                 EngineLog.emit("[Renderer] HDR10+ attachment count: \(hdr10PlusAttachedCount) (last payload \(hdr10PlusData.count) bytes)", category: .swPlayback)
             }
+        }
+        reorderLock.lock()
+        let inHandoff = handoffWindowActive(CFAbsoluteTimeGetCurrent())
+        reorderLock.unlock()
+        if inHandoff,
+           let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0 {
+            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
         }
         // Recover from failed queue target (Synchronizer/controlTimebase handoff races can push it here; flush recovers it).
         let target = queueTarget

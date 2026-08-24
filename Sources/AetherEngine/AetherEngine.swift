@@ -567,6 +567,11 @@ public final class AetherEngine: ObservableObject {
             if pictureInPictureActive && !oldValue && isBackgrounded {
                 softwareHost?.exitBackgroundAudioOnly()
             }
+            // Experiment: suspect #1 (render synchronizer) — bridge AVKit's
+            // layer re-host with display-immediately frames.
+            if pictureInPictureActive && !oldValue {
+                softwareHost?.beginPiPHandoffWindow()
+            }
             #endif
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the
