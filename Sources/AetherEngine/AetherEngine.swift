@@ -5561,7 +5561,19 @@ public final class AetherEngine: ObservableObject {
                             && routeNow == self.lastObservedAudioRouteID
                         self.lastObservedAudioRouteID = routeNow
                         if spurious {
-                            EngineLog.emit("[AetherEngine] interruption BEGAN ignored: spurious routeDisconnected (route unchanged, PiP active)", category: .engine)
+                            // Skipping the pause alone is not enough: the OS
+                            // really has halted the session (field log: clock
+                            // parked, enqueues stopped, frozen PiP frame) and
+                            // no ENDED ever follows. Mirror the halt, then
+                            // immediately reactivate and resume — play()
+                            // setActive(true)s a session an interruption
+                            // invalidated.
+                            EngineLog.emit("[AetherEngine] interruption BEGAN spurious routeDisconnected (route unchanged, PiP active): reactivating and resuming", category: .engine)
+                            self.rendererAudioSessionInterrupted = true
+                            self.activeTransportHost?.pause()
+                            if self.state == .playing { self.state = .paused }
+                            self.resumeAfterInterruption = false
+                            self.play()
                         } else {
                             self.rendererAudioSessionInterrupted = true
                             self.activeTransportHost?.pause()
