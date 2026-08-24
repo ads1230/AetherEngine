@@ -93,7 +93,7 @@ final class SoftwarePlaybackHost {
     var displayLayer: AVSampleBufferDisplayLayer { renderer.displayLayer }
 
     /// SW-PiP Phase C: engine-fed cue mirror + PiP gate for the renderer's frame compositor.
-    /// Experiment: suspect #1 (render synchronizer) — see SampleBufferRenderer.
+    /// PiP handoff fix — see SampleBufferRenderer.beginPiPHandoffWindow.
     func beginPiPHandoffWindow() {
         renderer.beginPiPHandoffWindow()
     }

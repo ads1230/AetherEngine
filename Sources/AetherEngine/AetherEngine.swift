@@ -567,8 +567,9 @@ public final class AetherEngine: ObservableObject {
             if pictureInPictureActive && !oldValue && isBackgrounded {
                 softwareHost?.exitBackgroundAudioOnly()
             }
-            // Experiment: suspect #1 (render synchronizer) — bridge AVKit's
-            // layer re-host with display-immediately frames.
+            // Bridge AVKit's layer re-host with display-immediately frames;
+            // the synchronizer clock stalls during the re-host (see
+            // SampleBufferRenderer.beginPiPHandoffWindow).
             if pictureInPictureActive && !oldValue {
                 softwareHost?.beginPiPHandoffWindow()
             }

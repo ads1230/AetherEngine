@@ -128,14 +128,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
     }
 
-    /// Experiment: PiP handoff window (suspect #1, the render synchronizer).
-    /// While AVKit re-hosts the layer into the PiP scene the synchronizer's
-    /// media-server clock can stall, starving the layer for 2-3 frames (the
-    /// auto-PiP black flash; the probe app, which presents display-immediately
-    /// with no synchronizer, is clean). For a few seconds around PiP start,
-    /// mark outgoing frames display-immediately so the layer presents them
-    /// regardless of the clock, and pace releases by wall clock so the
-    /// cushion cannot burst. All guarded by reorderLock.
+    /// PiP handoff window (device-verified fix, 2026-08-24). While AVKit
+    /// re-hosts the layer into the PiP scene, the synchronizer's media-server
+    /// clock stalls and starves the layer for 2-3 frames — the auto-PiP black
+    /// flash. Convicted by elimination: VOD PiP (AVPlayerLayer, no
+    /// synchronizer) was clean in-app, and a probe app driving the same layer
+    /// display-immediately with no synchronizer was clean too. For a few
+    /// seconds around PiP start, outgoing frames are marked
+    /// display-immediately so the layer presents them regardless of the
+    /// clock, paced by wall clock so the cushion cannot burst. The fixed
+    /// 40ms pace assumes ~25fps live; a 50fps stream shows half rate for 3s,
+    /// accepted. All guarded by reorderLock.
     private var pipHandoffDeadline: CFAbsoluteTime = 0
     private var lastHandoffRelease: CFAbsoluteTime = 0
 
