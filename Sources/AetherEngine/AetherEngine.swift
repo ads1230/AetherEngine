@@ -713,6 +713,13 @@ public final class AetherEngine: ObservableObject {
     /// on interruption end (see the observer in setupLifecycleObservers). Disarmed by user pause()
     /// and stopInternal().
     private var resumeAfterInterruption = false
+    /// Output-route fingerprint at the last route change, for telling a REAL
+    /// routeDisconnected interruption (AirPods walked away — route differs)
+    /// from the spurious BEGAN reason=4 iOS fires a few seconds into an
+    /// auto-PiP session with no route change and no ENDED (2026-08-24 field
+    /// logs: audio kept playing, so the session was never actually halted).
+    private var lastObservedAudioRouteID = ""
+
 
     /// An interruption deactivated the AVAudioSession under a renderer path (SW/audio host). A
     /// route-disconnect interruption (AirPods auto-switching away mid-PiP) may never post ENDED,
@@ -5494,6 +5501,15 @@ public final class AetherEngine: ObservableObject {
         }
         lifecycleObservers.append(fgObserver)
 
+        lastObservedAudioRouteID = Self.audioRouteID()
+        let routeObserver = nc.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(), queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.lastObservedAudioRouteID = Self.audioRouteID() }
+        }
+        lifecycleObservers.append(routeObserver)
+
         // Foreign-session interruption handling (Sodalite device-verify 2026-07-15): a live-camera
         // PiP re-claims the audio session on every play() and the system pauses AVPlayer ~10ms after
         // .playing (interruption BEGAN reason=default). The system pause never goes through pause(),
@@ -5532,9 +5548,25 @@ public final class AetherEngine: ObservableObject {
                     // Mirror the system pause into the transport. Deliberately NOT pause():
                     // that would disarm the resume above and schedule background teardowns.
                     if self.softwareHost != nil || self.audioHost != nil {
-                        self.rendererAudioSessionInterrupted = true
-                        self.activeTransportHost?.pause()
-                        if self.state == .playing { self.state = .paused }
+                        // Spurious BEGAN reason=4 during PiP: no route change,
+                        // no ENDED, session not actually halted (audio keeps
+                        // playing) — pausing here made AVKit fold and
+                        // re-present the live PiP window (the swipe-to-PiP
+                        // blink, absent before this pause shipped 2026-08-16).
+                        // A REAL disconnect changes the route and still
+                        // pauses, as do calls/Siri (reason 1).
+                        let routeNow = Self.audioRouteID()
+                        let spurious = self.pictureInPictureActive
+                            && reason == "4"
+                            && routeNow == self.lastObservedAudioRouteID
+                        self.lastObservedAudioRouteID = routeNow
+                        if spurious {
+                            EngineLog.emit("[AetherEngine] interruption BEGAN ignored: spurious routeDisconnected (route unchanged, PiP active)", category: .engine)
+                        } else {
+                            self.rendererAudioSessionInterrupted = true
+                            self.activeTransportHost?.pause()
+                            if self.state == .playing { self.state = .paused }
+                        }
                     }
                 } else {
                     let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
@@ -5559,6 +5591,11 @@ public final class AetherEngine: ObservableObject {
     }
 
     #if os(iOS) || os(tvOS)
+    /// Output-port fingerprint for spurious-interruption detection.
+    nonisolated static func audioRouteID() -> String {
+        AVAudioSession.sharedInstance().currentRoute.outputs.map(\.uid).joined(separator: "|")
+    }
+
     /// Release the video pipeline before tvOS suspension.
     ///
     /// stopInternal's replaceCurrentItem(nil) + VTDecompressionSession invalidation frees the shared
