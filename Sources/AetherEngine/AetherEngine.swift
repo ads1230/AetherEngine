@@ -5579,6 +5579,14 @@ public final class AetherEngine: ObservableObject {
                             self.activeTransportHost?.pause()
                             if self.state == .playing { self.state = .paused }
                             self.resumeAfterInterruption = false
+                            // The resume re-anchors the synchronizer clock —
+                            // the same disturbance the PiP re-host causes, and
+                            // it blanks the window the same way (field capture
+                            // 2026-08-24: flash at ~7s, outside the start
+                            // window). Bridge it with display-immediately too.
+                            if self.pictureInPictureActive {
+                                self.softwareHost?.beginPiPHandoffWindow()
+                            }
                             self.play()
                         } else {
                             self.rendererAudioSessionInterrupted = true
