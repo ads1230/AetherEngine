@@ -783,22 +783,13 @@ final class SoftwarePlaybackHost {
         // live-TS AAC whose codecpar the probe left empty makes av_find_best_stream return -1; the
         // by-type fallback (live-only) is what keeps SW-routed live TS from coming up silent.
         let bestAudioIdx = dem.audioStreamIndex
-        var resolvedAudioIdx = Self.resolveAudioStreamIndex(
+        let resolvedAudioIdx = Self.resolveAudioStreamIndex(
             explicit: audioSourceStreamIndex,
             bestStream: bestAudioIdx,
             firstByType: dem.firstAudioStreamIndexByType,
             isLive: isLive
         )
-        // Experiment 2 (PiP spurious-interruption provocateur hunt): the
-        // audio-renderer-free probe app never receives the reason=4
-        // interruption; this flag runs live sessions video-only (session
-        // still activates as usual) to isolate whether the
-        // AVSampleBufferAudioRenderer provokes it. Temporary; set by a test
-        // build of the app.
-        if isLive, UserDefaults.standard.bool(forKey: "aetherExperimentVideoOnlyLive") {
-            resolvedAudioIdx = -1
-            EngineLog.emit("[SWHost] EXPERIMENT: video-only live session (audio renderer disabled)", category: .swPlayback)
-        }
+
         if audioSourceStreamIndex == nil, bestAudioIdx < 0, resolvedAudioIdx >= 0 {
             EngineLog.emit(
                 "[SWHost] audio: av_find_best_stream found no usable audio "
