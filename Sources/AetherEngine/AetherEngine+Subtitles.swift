@@ -247,6 +247,11 @@ extension AetherEngine {
         subtitleResolutionCoverageStated.removeAll()   // #318
         subtitleDeliveryLastOutcome.removeAll()   // #357
         deferredDVBSubtitleEvents.removeAll()
+        // No drainer means nothing left to expire or replace the page; a stale one would hang
+        // on screen indefinitely. A session restart (audio switch) re-drains and the broadcast
+        // re-sends the held page within a couple of ticks.
+        dvbPageTrackers.removeAll()
+        if !dvbSubtitlePage.isEmpty { dvbSubtitlePage = [] }
         cancelSubtitleForwardPrefetcher()   // #151
     }
 
@@ -259,6 +264,8 @@ extension AetherEngine {
         subtitleResolutionCoverageStated.remove(channel)   // #318
         subtitleDeliveryLastOutcome[channel] = nil   // #357
         deferredDVBSubtitleEvents[channel] = nil
+        dvbPageTrackers[channel] = nil
+        if channel == .primary, !dvbSubtitlePage.isEmpty { dvbSubtitlePage = [] }
         refreshSubtitleStoreProtection()   // #166
         if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
     }
@@ -306,6 +313,7 @@ extension AetherEngine {
                 var cues = retainedSubtitleCues(for: channel)
                 let applied = applyDueDeferredDVBSubtitleEvents(to: &cues, channel: channel, playhead: playhead)
                 if applied.changed { publishRetainedSubtitleCues(cues, for: channel) }
+                publishDVBPageIfChanged(channel: channel, playhead: playhead)
                 subtitleDrainCursors[channel]?.lastPlayhead = playhead
                 // #276: an idle tick decoded nothing, so it banks nothing into the retained run.
                 // The frontier may well have moved under it; folding that in would claim
@@ -340,6 +348,11 @@ extension AetherEngine {
                 gate.reconstructing = true
                 pgsStaleArrivalGates[channel] = gate
                 deferredDVBSubtitleEvents[channel] = nil
+                // The on-screen DVB page belongs to the position this tick is leaving. The
+                // backscan below re-applies the display sets behind the landing, so the page at
+                // the landing point reconstructs before this tick's publish (expiry then drops a
+                // landing whose page has already timed out).
+                dvbPageTrackers[channel]?.clear()
                 window = (from, through)
             }
             if subtitleDrainDecoders[channel] == nil {
@@ -537,6 +550,7 @@ extension AetherEngine {
                 didMutate = true
             }
             if didMutate { publishRetainedSubtitleCues(cues, for: channel) }
+            publishDVBPageIfChanged(channel: channel, playhead: playhead)
             // #357: state what the tick did before the resolution line states how far it reached.
             // The two answer different questions and a report needs both: determination can keep
             // pace with every landing while delivery is empty, and that pairing is the whole
@@ -975,6 +989,20 @@ extension AetherEngine {
         }
     }
 
+    /// Run the page timeout on the playhead clock, then publish `dvbSubtitlePage` — only on
+    /// id-membership change, so re-send refreshes and no-op ticks cost consumers nothing.
+    /// Primary-channel only: the page publisher exists for the one on-screen overlay; a secondary
+    /// DVB track keeps the legacy retained-store path.
+    private func publishDVBPageIfChanged(channel: SubtitleChannel, playhead: Double) {
+        guard channel == .primary, var tracker = dvbPageTrackers[channel] else { return }
+        tracker.expire(at: playhead)
+        dvbPageTrackers[channel] = tracker
+        let cues = tracker.cues
+        if !cues.elementsEqual(dvbSubtitlePage, by: { $0.id == $1.id }) {
+            dvbSubtitlePage = cues
+        }
+    }
+
     /// Returns what the event did to the array (#357). An event that decodes but resolves to nothing
     /// new (a re-decoded cue the store already holds, a trim matching no open window) must not cost a
     /// publication: on a dense track that is the common case, and each publication makes every
@@ -1036,9 +1064,15 @@ extension AetherEngine {
         // DVB bitmap subtitles are page-state updates. A new page composition displayed at PTS
         // replaces the previous page; otherwise the retained store keeps old bitmap objects alive
         // until their page timeout and hosts stack or flicker between multiple active pages.
-        if let replaceAt = event.dvbPageReplaceAt,
-           Self.trimDVBBitmapCues(&cues, at: replaceAt, replacingWith: event.cues) {
-            applied.changed = true
+        if let replaceAt = event.dvbPageReplaceAt {
+            if Self.trimDVBBitmapCues(&cues, at: replaceAt, replacingWith: event.cues) {
+                applied.changed = true
+            }
+            // The page tracker is the authoritative on-screen state behind `dvbSubtitlePage`;
+            // the retained-store mutations above are bookkeeping (retention, backscans, PiP
+            // compositor). Published once per tick by publishDVBPageIfChanged.
+            dvbPageTrackers[channel, default: DVBSubtitlePageTracker()]
+                .apply(event.cues, nextID: &nextRetainedSubtitleCueID)
         }
         // #107: teletext page-state semantics; every event (content or erase) closes earlier
         // open text cues at its start, since libzvbi emits pages open-ended ("until replaced").

@@ -262,7 +262,9 @@ final class EmbeddedSubtitleDecoder {
                     videoWidth: Int(canvasW),
                     videoHeight: Int(canvasH)
                 ) {
-                    bodies.append(.image(image))
+                    // DVB rects are page state, not timed cues; the page tracker owns their
+                    // visibility (SubtitleImage.isPageBased).
+                    bodies.append(.image(isDVBBitmap ? image.pageBased() : image))
                 }
             }
         }

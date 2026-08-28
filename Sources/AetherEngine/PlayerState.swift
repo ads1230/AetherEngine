@@ -845,6 +845,13 @@ public struct SubtitleCue: Identifiable, Sendable {
         if case .image(let image) = body { return image.isForced }
         return false
     }
+
+    /// True for a bitmap cue of a page-state format (DVB); see `SubtitleImage.isPageBased`.
+    /// Hosts render these from `dvbSubtitlePage`, never from this cue's time window.
+    public var isPageBased: Bool {
+        if case .image(let image) = body { return image.isPageBased }
+        return false
+    }
 }
 
 extension SubtitleCue {
@@ -888,12 +895,28 @@ public struct SubtitleImage: @unchecked Sendable {
     /// AV_SUBTITLE_FLAG_FORCED from the decoded rect (#146): the disc authored this object as a
     /// forced caption (sign / foreign-dialogue overlay shown even with subtitles off).
     public let isForced: Bool
+    /// True for page-state formats (DVB): visibility is owned by the engine's page tracker and
+    /// published through `dvbSubtitlePage`, not by this cue's start/end window. The windows the
+    /// retained store publishes for these cues are re-send bookkeeping (a held page tiles into
+    /// short-window cues, see `alignCueEnds`); hosts must exclude page-based image cues from any
+    /// window-scheduled rendering and paint `dvbSubtitlePage` verbatim instead.
+    public let isPageBased: Bool
 
-    public init(cgImage: CGImage, position: CGRect, canvasSize: CGSize = .zero, isForced: Bool = false) {
+    public init(cgImage: CGImage, position: CGRect, canvasSize: CGSize = .zero, isForced: Bool = false,
+                isPageBased: Bool = false) {
         self.cgImage = cgImage
         self.position = position
         self.canvasSize = canvasSize
         self.isForced = isForced
+        self.isPageBased = isPageBased
+    }
+}
+
+extension SubtitleImage {
+    /// Copy marked page-based; see `isPageBased`.
+    func pageBased() -> SubtitleImage {
+        SubtitleImage(cgImage: cgImage, position: position, canvasSize: canvasSize,
+                      isForced: isForced, isPageBased: true)
     }
 }
 

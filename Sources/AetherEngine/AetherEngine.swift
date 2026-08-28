@@ -886,6 +886,18 @@ public final class AetherEngine: ObservableObject {
     /// Decoded cues for the active subtitle source (sidecar or embedded side-demuxer). When
     /// `LoadOptions.prepareNativeSubtitles` is set, cues also flow into NativeSubtitleCueStore for mov_text injection (#55).
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
+    /// The DVB subtitle page currently on screen (primary channel). Paint these cues verbatim:
+    /// empty means no page, ids are stable across broadcast re-sends, and the engine owns every
+    /// on/off decision — display-set replacement, page erase, the authored page timeout (so an
+    /// end-of-programme page clears without a host silence timer), seek reconstruction, and the
+    /// pause-hold contract (a paused clock holds the page). Do NOT window-filter these against the
+    /// playhead and do NOT render page-based image cues out of `subtitleCues`
+    /// (`SubtitleCue.isPageBased` marks them there; their published windows are re-send
+    /// bookkeeping, not visibility).
+    @Published public internal(set) var dvbSubtitlePage: [SubtitleCue] = []
+    /// Page state behind `dvbSubtitlePage`, per drained channel; only `.primary` publishes.
+    /// Mutated at display-set event application, expired + published once per drain tick.
+    var dvbPageTrackers: [SubtitleChannel: DVBSubtitlePageTracker] = [:]
     /// #100: per-channel holdback for PGS cues arriving behind the playhead (catch-up bursts after
     /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,
     /// clear, load/stop) so a hold can never leak across subtitle sessions.
@@ -5414,6 +5426,8 @@ public final class AetherEngine: ObservableObject {
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []
+        dvbPageTrackers = [:]
+        if !dvbSubtitlePage.isEmpty { dvbSubtitlePage = [] }
         pgsStaleArrivalGates = [:]   // #100: both channels; a hold never survives the session
         sidecarASSHeader = nil
         isLoadingSubtitles = false
