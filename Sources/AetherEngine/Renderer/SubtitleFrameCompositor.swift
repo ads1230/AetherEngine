@@ -124,7 +124,19 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         CVBufferPropagateAttachments(buffer, output)
         let base = CIImage(cvPixelBuffer: buffer)
         let composited = overlay.composited(over: base)
-        ciContext.render(composited, to: output, bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: CGColorSpace(name: CGColorSpace.itur_709))
+        // Encode into the colorimetry the output's own (just-propagated)
+        // attachments declare. The display decodes composited frames with
+        // those tags, so the encode must match them: a hardcoded 709 target
+        // lightened the whole picture for the lifetime of every DVB cue on
+        // 601-tagged SD live TV (field report 2026-08-28) — the same class
+        // of bug as the PAR drop the propagate call above fixes.
+        let destColorSpace = CVBufferCopyAttachments(output, .shouldPropagate)
+            .flatMap { CVImageBufferCreateColorSpaceFromAttachments($0)?.takeRetainedValue() }
+        ciContext.render(
+            composited, to: output,
+            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+            colorSpace: destColorSpace ?? CGColorSpace(name: CGColorSpace.itur_709)
+        )
         return output
     }
 
