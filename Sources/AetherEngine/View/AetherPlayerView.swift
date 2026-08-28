@@ -127,21 +127,6 @@ public final class AetherPlayerView: PlatformBaseView {
         CATransaction.commit()
     }
 
-    #if canImport(AppKit)
-    /// Engine-internal diagnostic: where the hosted layer lives (adoption
-    /// check for macOS PiP).
-    func describeHostedLayerForPiP() -> String {
-        guard let hosted = hostedLayer else { return "hosted=nil" }
-        let sup = hosted.superlayer
-        let supName = sup.map { String(describing: type(of: $0)) } ?? "nil"
-        let supDelegate = (sup?.delegate).map { String(describing: type(of: $0)) } ?? "nil"
-        return String(
-            format: "frame=%@ super=%@ superDelegate=%@ inOurTree=%d",
-            NSStringFromRect(hosted.frame), supName, supDelegate,
-            (sup === layerHostView.layer) ? 1 : 0
-        )
-    }
-    #endif
 
     // MARK: - Engine-only attachment
 

@@ -552,18 +552,45 @@ public final class AetherEngine: ObservableObject {
         }
     }
     #if os(macOS)
-    /// macOS AVKit PiP mirrors the sample-buffer layer WITHOUT reparenting or
-    /// resizing it (probe 2026-08-29: the layer never leaves the bound view's
-    /// subtree and keeps its app-window bounds, so the window showed an
-    /// unscaled crop). The render-size delegate callback is the sizing
-    /// contract — the host forwards it here and the bound view renders the
-    /// layer at AVKit's requested size until PiP ends.
-    public func setPiPRenderSize(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
+    private static let macPiPWindowSizeKey = "AetherEngine.macPiPWindowSize"
+    private var macPiPWindowPollTask: Task<Void, Never>?
+
+    /// Call BEFORE `startPictureInPicture`. macOS PiP (PIPAgent) captures the
+    /// layer's geometry AT START and mirrors it 1:1 into its window from then
+    /// on — probe suite 2026-08-29: post-start resizes render at the captured
+    /// size (broken mapping), a layer smaller than the window shows whole but
+    /// 1:1 with margins, a layer AT window size fills correctly. PIPAgent
+    /// remembers its window size across sessions, so the layer is pre-sized
+    /// to the persisted last-known window size (polled while PiP runs); the
+    /// first-ever session falls back to a modest 16:9 that under-fills
+    /// rather than crops and self-heals once a real size is persisted.
+    public func prepareMacPiPStart() {
+        var size = CGSize(width: 576, height: 324)
+        if let stored = UserDefaults.standard.string(forKey: Self.macPiPWindowSizeKey) {
+            let parsed = NSSizeFromString(stored)
+            if parsed.width > 50, parsed.height > 50 { size = parsed }
+        }
         EngineLog.emit(
-            "[AetherEngine] macOS PiP render size \(Int(size.width))x\(Int(size.height))",
+            "[AetherEngine] macOS PiP pre-size \(Int(size.width))x\(Int(size.height))",
             category: .engine)
         boundView?.setPiPOverrideSize(size)
+    }
+
+    /// The PiP window's on-screen size, via the window list (owner
+    /// "Picture in Picture"); bounds don't require capture permission.
+    private static func macPiPWindowSize() -> CGSize? {
+        guard let info = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        for window in info {
+            guard (window[kCGWindowOwnerName as String] as? String) == "Picture in Picture",
+                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat],
+                  let width = bounds["Width"], let height = bounds["Height"],
+                  width > 50, height > 50 else { continue }
+            return CGSize(width: width, height: height)
+        }
+        return nil
     }
     #endif
     /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
@@ -601,25 +628,26 @@ public final class AetherEngine: ObservableObject {
                 softwareHost?.beginPiPHandoffWindow()
             }
             #if os(macOS)
-            // Adoption check: with the layer hosted as a plain sublayer
-            // (2026-08-29), AVKit should take it into its DisplayLayerView —
-            // these lines prove or refute that in the field log.
+            // While PiP runs, remember the window's size for the NEXT
+            // session's pre-size (see prepareMacPiPStart) — never resize the
+            // layer mid-session, the agent's mapping is fixed at start.
             if pictureInPictureActive && !oldValue {
-                Task { @MainActor [weak self] in
-                    for probe in 1...3 {
-                        guard let self, self.pictureInPictureActive else { return }
-                        if let view = self.boundView {
-                            EngineLog.emit(
-                                "[AetherEngine] macOS PiP adopt probe #\(probe): \(view.describeHostedLayerForPiP())",
-                                category: .engine)
+                macPiPWindowPollTask?.cancel()
+                macPiPWindowPollTask = Task { @MainActor [weak self] in
+                    while let self, self.pictureInPictureActive, !Task.isCancelled {
+                        if let size = Self.macPiPWindowSize() {
+                            UserDefaults.standard.set(
+                                NSStringFromSize(size), forKey: Self.macPiPWindowSizeKey)
                         }
-                        try? await Task.sleep(for: .milliseconds(600))
+                        try? await Task.sleep(for: .seconds(1))
                     }
                 }
             }
-            // PiP over: drop the render-size override so the layer returns
-            // to the view's own bounds (see setPiPRenderSize).
+            // PiP over: drop the pre-size override so the layer returns to
+            // the view's own bounds.
             if oldValue && !pictureInPictureActive {
+                macPiPWindowPollTask?.cancel()
+                macPiPWindowPollTask = nil
                 boundView?.setPiPOverrideSize(nil)
             }
             #endif
