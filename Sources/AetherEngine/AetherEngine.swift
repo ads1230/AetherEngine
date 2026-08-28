@@ -718,8 +718,11 @@ public final class AetherEngine: ObservableObject {
     public var nativePlayerLayer: AVPlayerLayer? { nativeHost?.playerLayer }
     #if os(iOS) || os(tvOS)
     /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown
-    /// (iOS) and the PiP-closed-while-backgrounded teardown (tvOS).
-    private var isBackgrounded = false
+    /// (iOS) and the PiP-closed-while-backgrounded teardown (tvOS). Seeded from the real application
+    /// state at observer setup (internal for the Loading extension's start-backgrounded shed): an
+    /// engine created while the app is already backgrounded — a lock-screen play command re-tuning a
+    /// parked session — otherwise believes it is foreground.
+    var isBackgrounded = false
     #endif
     #if os(iOS)
     /// #127: pending grace-window teardown (sleep task + the background-task assertion holding it).
@@ -5468,6 +5471,9 @@ public final class AetherEngine: ObservableObject {
     // MARK: - App Lifecycle
 
     private func setupLifecycleObservers() {
+        #if os(iOS)
+        isBackgrounded = UIApplication.shared.applicationState == .background
+        #endif
         #if os(iOS) || os(tvOS)
         let nc = NotificationCenter.default
 

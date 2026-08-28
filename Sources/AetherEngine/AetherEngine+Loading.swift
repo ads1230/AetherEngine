@@ -1419,8 +1419,14 @@ extension AetherEngine {
         host.setVideoSampleTap(softwareVideoSampleTap)
         host.audioSampleTap = softwareAudioSampleTap
         // A load while the host still hides the picture (zap from a hidden
-        // tab) starts the new session audio-only too.
-        if hostAudioOnlyActive { host.enterBackgroundAudioOnly() }
+        // tab) starts the new session audio-only too. Same for a load while
+        // the app is BACKGROUNDED (lock-screen play command re-tuning a
+        // parked session): didEnterBackground already fired, so the shed
+        // decision must be re-made here or the fresh session runs the full
+        // video pipeline with no GPU access; didBecomeActive un-sheds.
+        if hostAudioOnlyActive || (isBackgrounded && !pictureInPictureActive) {
+            host.enterBackgroundAudioOnly()
+        }
         // #353: the settled picture size, wired next to the frame times because a host laying out an
         // overlay needs the rectangle as well as the clock, and both come off this renderer.
         mirrorSoftwareDisplaySize(from: host.$videoDisplaySize, storeIn: &softwareCancellables)
