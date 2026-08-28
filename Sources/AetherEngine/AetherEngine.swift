@@ -567,6 +567,17 @@ public final class AetherEngine: ObservableObject {
             if pictureInPictureActive && !oldValue && isBackgrounded {
                 softwareHost?.exitBackgroundAudioOnly()
             }
+            // Mirror on the falling edge: the host's phantom-fold handling
+            // keeps the transport PLAYING after AVKit stops the window
+            // (awaiting the re-present), so a backgrounded session would
+            // otherwise grind the full video pipeline — VT deinterlace, CI
+            // burn-in, layer enqueue — with no window to show it, and iOS
+            // rejects every GPU submission (IOGPUMetalError flood, field log
+            // 2026-08-28). Re-shed to audio-only; a re-present un-sheds
+            // above and resyncs at the next keyframe.
+            if !pictureInPictureActive && oldValue && isBackgrounded {
+                softwareHost?.enterBackgroundAudioOnly()
+            }
             #endif
             // Bridge AVKit's layer re-host with display-immediately frames;
             // the synchronizer clock stalls during the re-host (see
