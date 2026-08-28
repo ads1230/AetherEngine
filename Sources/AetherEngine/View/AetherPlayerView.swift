@@ -215,21 +215,38 @@ public struct AetherPlayerSurface: NSViewRepresentable {
         self.engine = engine
     }
 
-    public func makeNSView(context: Context) -> AetherPlayerView {
+    public func makeNSView(context: Context) -> NSView {
+        // Plain container between AetherPlayerView and SwiftUI: macOS PiP
+        // inserts its stand-in views (AVPictureInPicturePlayerLayerView /
+        // AVPictureInPictureSampleBufferDisplayLayerView) into superviews of
+        // the video hosting chain, and SwiftUI mounts a representable's view
+        // DIRECTLY inside NSHostingView — so the player view's own superview
+        // was the hosting view and startPictureInPicture tripped SwiftUI's
+        // "not supported as a subview of NSHostingController.view" runtime
+        // issue (field report 2026-08-28). With this level plus the inner
+        // layerHostView, every AVKit insertion point is a plain NSView.
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.backgroundColor = CGColor.black
         let view = AetherPlayerView()
+        view.frame = container.bounds
+        view.autoresizingMask = [.width, .height]
+        container.addSubview(view)
         engine.bind(view: view)
-        return view
+        return container
     }
 
-    public func updateNSView(_ nsView: AetherPlayerView, context: Context) {
+    public func updateNSView(_ nsView: NSView, context: Context) {
         // #188: rebind on update so an engine swap at the same structural position
         // takes over the reused view. Idempotent for the steady-state case.
-        engine.bind(view: nsView)
+        guard let view = nsView.subviews.compactMap({ $0 as? AetherPlayerView }).first else { return }
+        engine.bind(view: view)
     }
 
-    public static func dismantleNSView(_ nsView: AetherPlayerView, coordinator: ()) {
+    public static func dismantleNSView(_ nsView: NSView, coordinator: ()) {
+        let view = nsView.subviews.compactMap({ $0 as? AetherPlayerView }).first
         Task { @MainActor in
-            nsView.detach()
+            view?.detach()
         }
     }
 }
