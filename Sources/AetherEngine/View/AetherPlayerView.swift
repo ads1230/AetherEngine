@@ -92,76 +92,40 @@ public final class AetherPlayerView: PlatformBaseView {
     }
     #endif
 
+    #if canImport(AppKit)
+    /// macOS AVKit PiP MIRRORS the sample-buffer layer without reparenting or
+    /// resizing it (probe 2026-08-29: the layer stays this view's subtree at
+    /// app-window bounds through the whole session, so the window showed an
+    /// unscaled crop). The sizing contract is the render-size delegate
+    /// callback: while set, the layer renders at AVKit's requested size and
+    /// the mirror shows the whole frame.
+    private var pipOverrideSize: CGSize?
+
+    /// Engine-internal: AVKit's PiP render size (nil = PiP over, back to the
+    /// view's own bounds).
+    func setPiPOverrideSize(_ size: CGSize?) {
+        pipOverrideSize = size
+        applyLayerFrame()
+    }
+    #endif
+
     private func applyLayerFrame() {
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         #if canImport(AppKit)
-        layerHostView.frame = bounds
-        // While AVKit's PiP window owns the hosted layer (reparented out of
-        // this view's tree), its geometry belongs to AVKit: re-imposing the
-        // app-side bounds from every layout pass left the PiP window showing
-        // an unscaled top-left crop of the frame (HDHomeRun SD, 2026-08-28).
-        // The engine re-applies via reapplyHostedLayerFrame when PiP ends.
-        let reparentedByPiP = hosted.superlayer !== nil && hosted.superlayer !== layer
-        if !reparentedByPiP {
-            if hosted === layerHostView.layer {
-                hosted.bounds = layerHostView.bounds
-            } else {
-                hosted.frame = bounds
-            }
+        let target = pipOverrideSize.map { CGRect(origin: .zero, size: $0) } ?? bounds
+        layerHostView.frame = target
+        if hosted === layerHostView.layer {
+            hosted.bounds = layerHostView.bounds
+        } else {
+            hosted.frame = target
         }
         #else
         hosted.frame = bounds
         #endif
         CATransaction.commit()
     }
-
-    #if canImport(AppKit)
-    /// Engine-internal: PiP returned the layer to this view's tree — re-take
-    /// its geometry (layout alone may not fire after the reparent).
-    func reapplyHostedLayerFrame() {
-        applyLayerFrame()
-    }
-
-    /// Engine-internal: while AVKit's PiP window owns the hosted layer it
-    /// never sizes it (an autoresizing mask only tracks LATER superlayer
-    /// deltas), so the layer kept its app-window bounds and the PiP window
-    /// showed an unscaled crop (2026-08-28). Fit it to the PiP-side
-    /// superlayer; returns true while the layer is reparented.
-    @discardableResult
-    func fitHostedLayerForPiPIfReparented() -> Bool {
-        guard let hosted = hostedLayer, let superlayer = hosted.superlayer,
-              superlayer !== layer else { return false }
-        if hosted.frame != superlayer.bounds {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            hosted.frame = superlayer.bounds
-            CATransaction.commit()
-        }
-        return true
-    }
-
-    /// Engine-internal, diagnostic: one line describing where the hosted
-    /// layer sits right now (2026-08-29: the PiP crop persisted with NO
-    /// reparent detected, so the fit never fired — this names macOS AVKit's
-    /// actual hosting arrangement in the field log).
-    func describeHostedLayerForPiP() -> String {
-        guard let hosted = hostedLayer else { return "hosted=nil" }
-        let sup = hosted.superlayer
-        let supName = sup.map { String(describing: type(of: $0)) } ?? "nil"
-        let supDelegate = (sup?.delegate).map { String(describing: type(of: $0)) } ?? "nil"
-        let reparented = sup !== layer
-        return String(
-            format: "hosted=%@ frame=%@ super=%@ superDelegate=%@ superBounds=%@ reparented=%d",
-            String(describing: type(of: hosted)),
-            NSStringFromRect(hosted.frame),
-            supName, supDelegate,
-            NSStringFromRect(sup?.bounds ?? .zero),
-            reparented ? 1 : 0
-        )
-    }
-    #endif
 
     // MARK: - Engine-only attachment
 

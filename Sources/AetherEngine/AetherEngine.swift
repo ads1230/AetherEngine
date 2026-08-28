@@ -552,9 +552,19 @@ public final class AetherEngine: ObservableObject {
         }
     }
     #if os(macOS)
-    /// Keeps the hosted layer fitted to AVKit's PiP window while it owns it
-    /// (see the pictureInPictureActive didSet).
-    private var macPiPLayerFitTask: Task<Void, Never>?
+    /// macOS AVKit PiP mirrors the sample-buffer layer WITHOUT reparenting or
+    /// resizing it (probe 2026-08-29: the layer never leaves the bound view's
+    /// subtree and keeps its app-window bounds, so the window showed an
+    /// unscaled crop). The render-size delegate callback is the sizing
+    /// contract — the host forwards it here and the bound view renders the
+    /// layer at AVKit's requested size until PiP ends.
+    public func setPiPRenderSize(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        EngineLog.emit(
+            "[AetherEngine] macOS PiP render size \(Int(size.width))x\(Int(size.height))",
+            category: .engine)
+        boundView?.setPiPOverrideSize(size)
+    }
     #endif
     /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
     /// the keepalive policy + pause-safety read it.
@@ -591,42 +601,10 @@ public final class AetherEngine: ObservableObject {
                 softwareHost?.beginPiPHandoffWindow()
             }
             #if os(macOS)
-            // AVKit reparents the hosted layer into its PiP window but never
-            // SIZES it there (autoresizing masks only track later superlayer
-            // deltas): the layer kept its app-window bounds and the window
-            // showed an unscaled crop (2026-08-28). While PiP is active, fit
-            // the layer to its PiP-side superlayer (covers the initial
-            // reparent and user resizes of the window); the falling edge
-            // re-takes app-side geometry — layout alone is not guaranteed to
-            // fire after the return reparent.
-            if pictureInPictureActive && !oldValue {
-                macPiPLayerFitTask?.cancel()
-                macPiPLayerFitTask = Task { @MainActor [weak self] in
-                    var announced = false
-                    var probes = 0
-                    while let self, self.pictureInPictureActive, !Task.isCancelled {
-                        if self.boundView?.fitHostedLayerForPiPIfReparented() == true, !announced {
-                            announced = true
-                            EngineLog.emit("[AetherEngine] macOS PiP layer fit engaged", category: .engine)
-                        }
-                        // 2026-08-29: the crop persisted with NO reparent ever
-                        // detected — AVKit's macOS arrangement is not what the
-                        // fit assumed. Name it in the log (first 3s of each
-                        // session) so the next capture settles it.
-                        if probes < 12, let view = self.boundView {
-                            probes += 1
-                            EngineLog.emit(
-                                "[AetherEngine] macOS PiP probe #\(probes): \(view.describeHostedLayerForPiP())",
-                                category: .engine)
-                        }
-                        try? await Task.sleep(for: .milliseconds(250))
-                    }
-                }
-            }
+            // PiP over: drop the render-size override so the layer returns
+            // to the view's own bounds (see setPiPRenderSize).
             if oldValue && !pictureInPictureActive {
-                macPiPLayerFitTask?.cancel()
-                macPiPLayerFitTask = nil
-                boundView?.reapplyHostedLayerFrame()
+                boundView?.setPiPOverrideSize(nil)
             }
             #endif
             #if os(tvOS)
