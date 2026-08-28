@@ -314,6 +314,7 @@ extension AetherEngine {
                 let applied = applyDueDeferredDVBSubtitleEvents(to: &cues, channel: channel, playhead: playhead)
                 if applied.changed { publishRetainedSubtitleCues(cues, for: channel) }
                 publishDVBPageIfChanged(channel: channel, playhead: playhead)
+                syncSubtitleCompositorFeed()
                 subtitleDrainCursors[channel]?.lastPlayhead = playhead
                 // #276: an idle tick decoded nothing, so it banks nothing into the retained run.
                 // The frontier may well have moved under it; folding that in would claim
@@ -551,6 +552,7 @@ extension AetherEngine {
             }
             if didMutate { publishRetainedSubtitleCues(cues, for: channel) }
             publishDVBPageIfChanged(channel: channel, playhead: playhead)
+            syncSubtitleCompositorFeed()
             // #357: state what the tick did before the resolution line states how far it reached.
             // The two answer different questions and a report needs both: determination can keep
             // pace with every landing while delivery is empty, and that pairing is the whole
@@ -990,12 +992,58 @@ extension AetherEngine {
     }
 
     /// Everything the SW-PiP frame compositor should draw: the window-timed retained cues plus
-    /// the DVB page. Page cues are on screen exactly while present in `dvbSubtitlePage` — their
-    /// stored windows are decoder bookkeeping — so they are widened to open-ended windows and the
-    /// compositor's frame-PTS filter passes them until the next page publish removes them.
+    /// the DVB page as a PTS-windowed TIMELINE, not a snapshot. Burn-in runs at frame ENQUEUE,
+    /// one render cushion (~1-2s) ahead of display, while `dvbSubtitlePage` applies at the
+    /// PLAYHEAD — feeding the snapshot alone showed every page one cushion late in the PiP
+    /// window, because the frames covering its start were already enqueued bare (field report
+    /// 2026-08-28). The engine already holds the future — decoded-ahead display sets wait in
+    /// `deferredDVBSubtitleEvents` — so the feed simulates the page forward and the compositor's
+    /// frame-PTS filter burns each enqueued frame with the page on screen when that frame presents.
     var subtitleCompositorFeedCues: [SubtitleCue] {
-        subtitleCues + secondarySubtitleCues
-            + dvbSubtitlePage.map { $0.with(endTime: .greatestFiniteMagnitude) }
+        subtitleCues + secondarySubtitleCues + Self.dvbCompositorTimeline(
+            page: dvbSubtitlePage,
+            tracker: dvbPageTrackers[.primary] ?? DVBSubtitlePageTracker(),
+            deferred: (deferredDVBSubtitleEvents[.primary] ?? [])
+                .filter { $0.event.dvbPageReplaceAt != nil }
+                .map { ($0.presentationTime, $0.event.cues) }
+        )
+    }
+
+    /// The current page bounded at the first future display set, then each simulated future page
+    /// over its own interval. Pure so the interval math is testable; `tracker` is a value copy, the
+    /// simulation never touches live state. Simulated new content draws ids from a
+    /// presentation-time-derived NEGATIVE base: they cannot collide with retained/page cue ids
+    /// (session-monotonic, positive) and stay stable across recomputes so the compositor's overlay
+    /// cache holds; re-sent regions keep their live ids via the tracker's geometry fold-in.
+    nonisolated static func dvbCompositorTimeline(
+        page: [SubtitleCue],
+        tracker: DVBSubtitlePageTracker,
+        deferred: [(presentationTime: Double, cues: [SubtitleCue])]
+    ) -> [SubtitleCue] {
+        let firstChange = deferred.first?.presentationTime ?? .greatestFiniteMagnitude
+        var timeline = page.map { $0.with(endTime: firstChange) }
+        guard !deferred.isEmpty else { return timeline }
+        var tracker = tracker
+        for (index, item) in deferred.enumerated() {
+            tracker.expire(at: item.presentationTime)
+            var simID = -(Int(item.presentationTime * 1000.0) &* 64)
+            tracker.apply(item.cues, nextID: &simID)
+            let start = item.presentationTime
+            let end = index + 1 < deferred.count
+                ? deferred[index + 1].presentationTime : .greatestFiniteMagnitude
+            guard end > start else { continue }
+            timeline += tracker.cues.map { $0.with(startTime: start, endTime: end) }
+        }
+        return timeline
+    }
+
+    /// Pushed after every drain tick: a decoded-ahead display set lands in the deferred queue
+    /// without publishing any Combine-observed array, and the burn-in needs that future BEFORE
+    /// the page applies at the playhead. The compositor-side update is an array swap under a
+    /// lock; per-tick cost is negligible.
+    private func syncSubtitleCompositorFeed() {
+        softwareHost?.updateSubtitleCompositor(cues: subtitleCompositorFeedCues,
+                                               enabled: pictureInPictureActive)
     }
 
     /// Run the page timeout on the playhead clock, then publish `dvbSubtitlePage` — only on
