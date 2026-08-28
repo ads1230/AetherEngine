@@ -585,6 +585,16 @@ public final class AetherEngine: ObservableObject {
             if pictureInPictureActive && !oldValue {
                 softwareHost?.beginPiPHandoffWindow()
             }
+            #if os(macOS)
+            // AVKit reparents the hosted layer into its PiP window; the view
+            // leaves the layer's geometry to AVKit while it is away (an
+            // app-side layout pass mid-PiP showed an unscaled crop in the
+            // window, 2026-08-28) and must re-take it on return — layout
+            // alone is not guaranteed to fire after the reparent.
+            if oldValue && !pictureInPictureActive {
+                boundView?.reapplyHostedLayerFrame()
+            }
+            #endif
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the
             // wedge-safe teardown now, before idle suspension (mirrors the iOS pause-while-backgrounded path).

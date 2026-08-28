@@ -98,16 +98,32 @@ public final class AetherPlayerView: PlatformBaseView {
         CATransaction.setDisableActions(true)
         #if canImport(AppKit)
         layerHostView.frame = bounds
-        if hosted === layerHostView.layer {
-            hosted.bounds = layerHostView.bounds
-        } else {
-            hosted.frame = bounds
+        // While AVKit's PiP window owns the hosted layer (reparented out of
+        // this view's tree), its geometry belongs to AVKit: re-imposing the
+        // app-side bounds from every layout pass left the PiP window showing
+        // an unscaled top-left crop of the frame (HDHomeRun SD, 2026-08-28).
+        // The engine re-applies via reapplyHostedLayerFrame when PiP ends.
+        let reparentedByPiP = hosted.superlayer !== nil && hosted.superlayer !== layer
+        if !reparentedByPiP {
+            if hosted === layerHostView.layer {
+                hosted.bounds = layerHostView.bounds
+            } else {
+                hosted.frame = bounds
+            }
         }
         #else
         hosted.frame = bounds
         #endif
         CATransaction.commit()
     }
+
+    #if canImport(AppKit)
+    /// Engine-internal: PiP returned the layer to this view's tree — re-take
+    /// its geometry (layout alone may not fire after the reparent).
+    func reapplyHostedLayerFrame() {
+        applyLayerFrame()
+    }
+    #endif
 
     // MARK: - Engine-only attachment
 
