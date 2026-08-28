@@ -141,6 +141,26 @@ public final class AetherPlayerView: PlatformBaseView {
         }
         return true
     }
+
+    /// Engine-internal, diagnostic: one line describing where the hosted
+    /// layer sits right now (2026-08-29: the PiP crop persisted with NO
+    /// reparent detected, so the fit never fired — this names macOS AVKit's
+    /// actual hosting arrangement in the field log).
+    func describeHostedLayerForPiP() -> String {
+        guard let hosted = hostedLayer else { return "hosted=nil" }
+        let sup = hosted.superlayer
+        let supName = sup.map { String(describing: type(of: $0)) } ?? "nil"
+        let supDelegate = (sup?.delegate).map { String(describing: type(of: $0)) } ?? "nil"
+        let reparented = sup !== layer
+        return String(
+            format: "hosted=%@ frame=%@ super=%@ superDelegate=%@ superBounds=%@ reparented=%d",
+            String(describing: type(of: hosted)),
+            NSStringFromRect(hosted.frame),
+            supName, supDelegate,
+            NSStringFromRect(sup?.bounds ?? .zero),
+            reparented ? 1 : 0
+        )
+    }
     #endif
 
     // MARK: - Engine-only attachment

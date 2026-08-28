@@ -603,10 +603,21 @@ public final class AetherEngine: ObservableObject {
                 macPiPLayerFitTask?.cancel()
                 macPiPLayerFitTask = Task { @MainActor [weak self] in
                     var announced = false
+                    var probes = 0
                     while let self, self.pictureInPictureActive, !Task.isCancelled {
                         if self.boundView?.fitHostedLayerForPiPIfReparented() == true, !announced {
                             announced = true
                             EngineLog.emit("[AetherEngine] macOS PiP layer fit engaged", category: .engine)
+                        }
+                        // 2026-08-29: the crop persisted with NO reparent ever
+                        // detected — AVKit's macOS arrangement is not what the
+                        // fit assumed. Name it in the log (first 3s of each
+                        // session) so the next capture settles it.
+                        if probes < 12, let view = self.boundView {
+                            probes += 1
+                            EngineLog.emit(
+                                "[AetherEngine] macOS PiP probe #\(probes): \(view.describeHostedLayerForPiP())",
+                                category: .engine)
                         }
                         try? await Task.sleep(for: .milliseconds(250))
                     }
