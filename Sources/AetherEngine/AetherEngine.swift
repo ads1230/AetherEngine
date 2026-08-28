@@ -551,6 +551,11 @@ public final class AetherEngine: ObservableObject {
             #endif
         }
     }
+    #if os(macOS)
+    /// Keeps the hosted layer fitted to AVKit's PiP window while it owns it
+    /// (see the pictureInPictureActive didSet).
+    private var macPiPLayerFitTask: Task<Void, Never>?
+    #endif
     /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
     /// the keepalive policy + pause-safety read it.
     public var pictureInPictureActive = false {
@@ -586,12 +591,30 @@ public final class AetherEngine: ObservableObject {
                 softwareHost?.beginPiPHandoffWindow()
             }
             #if os(macOS)
-            // AVKit reparents the hosted layer into its PiP window; the view
-            // leaves the layer's geometry to AVKit while it is away (an
-            // app-side layout pass mid-PiP showed an unscaled crop in the
-            // window, 2026-08-28) and must re-take it on return — layout
-            // alone is not guaranteed to fire after the reparent.
+            // AVKit reparents the hosted layer into its PiP window but never
+            // SIZES it there (autoresizing masks only track later superlayer
+            // deltas): the layer kept its app-window bounds and the window
+            // showed an unscaled crop (2026-08-28). While PiP is active, fit
+            // the layer to its PiP-side superlayer (covers the initial
+            // reparent and user resizes of the window); the falling edge
+            // re-takes app-side geometry — layout alone is not guaranteed to
+            // fire after the return reparent.
+            if pictureInPictureActive && !oldValue {
+                macPiPLayerFitTask?.cancel()
+                macPiPLayerFitTask = Task { @MainActor [weak self] in
+                    var announced = false
+                    while let self, self.pictureInPictureActive, !Task.isCancelled {
+                        if self.boundView?.fitHostedLayerForPiPIfReparented() == true, !announced {
+                            announced = true
+                            EngineLog.emit("[AetherEngine] macOS PiP layer fit engaged", category: .engine)
+                        }
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                }
+            }
             if oldValue && !pictureInPictureActive {
+                macPiPLayerFitTask?.cancel()
+                macPiPLayerFitTask = nil
                 boundView?.reapplyHostedLayerFrame()
             }
             #endif

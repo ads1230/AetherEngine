@@ -123,6 +123,24 @@ public final class AetherPlayerView: PlatformBaseView {
     func reapplyHostedLayerFrame() {
         applyLayerFrame()
     }
+
+    /// Engine-internal: while AVKit's PiP window owns the hosted layer it
+    /// never sizes it (an autoresizing mask only tracks LATER superlayer
+    /// deltas), so the layer kept its app-window bounds and the PiP window
+    /// showed an unscaled crop (2026-08-28). Fit it to the PiP-side
+    /// superlayer; returns true while the layer is reparented.
+    @discardableResult
+    func fitHostedLayerForPiPIfReparented() -> Bool {
+        guard let hosted = hostedLayer, let superlayer = hosted.superlayer,
+              superlayer !== layer else { return false }
+        if hosted.frame != superlayer.bounds {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            hosted.frame = superlayer.bounds
+            CATransaction.commit()
+        }
+        return true
+    }
     #endif
 
     // MARK: - Engine-only attachment
