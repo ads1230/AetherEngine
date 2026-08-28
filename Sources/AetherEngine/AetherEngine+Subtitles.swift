@@ -989,10 +989,20 @@ extension AetherEngine {
         }
     }
 
+    /// Everything the SW-PiP frame compositor should draw: the window-timed retained cues plus
+    /// the DVB page. Page cues are on screen exactly while present in `dvbSubtitlePage` — their
+    /// stored windows are decoder bookkeeping — so they are widened to open-ended windows and the
+    /// compositor's frame-PTS filter passes them until the next page publish removes them.
+    var subtitleCompositorFeedCues: [SubtitleCue] {
+        subtitleCues + secondarySubtitleCues
+            + dvbSubtitlePage.map { $0.with(endTime: .greatestFiniteMagnitude) }
+    }
+
     /// Run the page timeout on the playhead clock, then publish `dvbSubtitlePage` — only on
     /// id-membership change, so re-send refreshes and no-op ticks cost consumers nothing.
-    /// Primary-channel only: the page publisher exists for the one on-screen overlay; a secondary
-    /// DVB track keeps the legacy retained-store path.
+    /// Primary-channel only: page-based cues no longer enter the retained store on any channel,
+    /// so a DVB track selected as SECONDARY is tracked but not published anywhere — no known host
+    /// renders secondary bitmaps. If one ever does, publish the secondary tracker alongside.
     private func publishDVBPageIfChanged(channel: SubtitleChannel, playhead: Double) {
         guard channel == .primary, var tracker = dvbPageTrackers[channel] else { return }
         tracker.expire(at: playhead)
@@ -1012,24 +1022,6 @@ extension AetherEngine {
                                     to cues: inout [SubtitleCue],
                                     channel: SubtitleChannel) -> SubtitleDeliveryStatement.Application {
         guard isSubtitleActive(for: channel) else { return .init() }
-
-        // #357: primary-only, and budgeted per seek generation rather than per load, so a seek
-        // sequence stays observable to its end. The playhead is `sourceTime`, the axis cue
-        // timestamps are on; `currentTime` rides beside it because their difference is the playlist
-        // shift, and reading the two as one clock has cost a round of diagnosis before.
-        if channel == .primary, let firstCue = event.cues.first,
-           subtitleCueDiagnosticBudget.claim(generation: currentSeekGeneration) {
-            EngineLog.emit(
-                "[applySubtitleEvent] " +
-                "cueStart=\(String(format: "%.3f", firstCue.startTime))s " +
-                "cueEnd=\(String(format: "%.3f", firstCue.endTime))s " +
-                "sourceTime=\(String(format: "%.3f", sourceTime))s " +
-                "engine.currentTime=\(String(format: "%.3f", currentTime))s " +
-                "seekGen=\(currentSeekGeneration)",
-                category: .engine
-            )
-        }
-
         return applyEventMutations(event, to: &cues, channel: channel)
     }
 
@@ -1061,18 +1053,18 @@ extension AetherEngine {
                 }
             }
         }
-        // DVB bitmap subtitles are page-state updates. A new page composition displayed at PTS
-        // replaces the previous page; otherwise the retained store keeps old bitmap objects alive
-        // until their page timeout and hosts stack or flicker between multiple active pages.
-        if let replaceAt = event.dvbPageReplaceAt {
-            if Self.trimDVBBitmapCues(&cues, at: replaceAt, replacingWith: event.cues) {
-                applied.changed = true
-            }
-            // The page tracker is the authoritative on-screen state behind `dvbSubtitlePage`;
-            // the retained-store mutations above are bookkeeping (retention, backscans, PiP
-            // compositor). Published once per tick by publishDVBPageIfChanged.
+        // DVB bitmap subtitles are page-state updates, owned entirely by the page tracker behind
+        // `dvbSubtitlePage` (published once per tick by publishDVBPageIfChanged). They never enter
+        // the retained store: nothing reads them there — seek backscans re-decode from the packet
+        // store, and the PiP compositor and hosts consume the page — while retaining them cost a
+        // decoded RGBA image per re-send for the whole retention window.
+        if event.dvbPageReplaceAt != nil {
             dvbPageTrackers[channel, default: DVBSubtitlePageTracker()]
                 .apply(event.cues, nextID: &nextRetainedSubtitleCueID)
+            // Delivered to the page, not the store; counted so the #357 delivery statement
+            // still reads `published` for a tick whose only output was a page update.
+            applied.admitted += event.cues.count
+            applied.published += event.cues.count
         }
         // #107: teletext page-state semantics; every event (content or erase) closes earlier
         // open text cues at its start, since libzvbi emits pages open-ended ("until replaced").
@@ -1088,6 +1080,7 @@ extension AetherEngine {
         let admitted = pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
             .admit(cues: event.cues, isPGS: event.isPGS,
                    isSelfContained: event.isSelfContainedPGS, playhead: sourceTime)
+            .filter { !$0.isPageBased }   // page-based (DVB) cues live in the tracker, never the store
         applied.admitted += admitted.count
         for cue in admitted {
             if insertSorted(cue, into: &cues) {
@@ -1121,44 +1114,6 @@ extension AetherEngine {
             }
         }
         return changed
-    }
-
-    /// DVB page-state replacement: close older bitmap cues whose window covers the new page PTS.
-    /// Cue-less page erases clear the whole bitmap page. Non-empty updates replace only older
-    /// bitmap regions they overlap: SD DVB captions often emit a two-line sentence as separate
-    /// row/object updates one or two video frames apart, and a purely time-based page replacement
-    /// can erase row one when row two arrives.
-    @discardableResult
-    nonisolated static func trimDVBBitmapCues(_ cues: inout [SubtitleCue], at replaceAt: Double, replacingWith replacingCues: [SubtitleCue]) -> Bool {
-        var changed = false
-        for i in 0..<cues.count {
-            guard case .image = cues[i].body else { continue }
-            let cue = cues[i]
-            guard cue.startTime < replaceAt - dvbPageReplacementToleranceSeconds,
-                  cue.endTime > replaceAt else {
-                continue
-            }
-            if !replacingCues.isEmpty,
-               !Self.dvbBitmapCue(cue, overlapsAnyOf: replacingCues) {
-                continue
-            }
-            cues[i] = cue.with(endTime: replaceAt)
-            changed = true
-        }
-        return changed
-    }
-
-    nonisolated static let dvbPageReplacementToleranceSeconds: Double = 0.001
-
-    nonisolated static func dvbBitmapCue(_ cue: SubtitleCue, overlapsAnyOf replacingCues: [SubtitleCue]) -> Bool {
-        guard case .image(let oldImage) = cue.body else { return false }
-        for replacingCue in replacingCues {
-            guard case .image(let newImage) = replacingCue.body else { continue }
-            if oldImage.position.intersects(newImage.position) {
-                return true
-            }
-        }
-        return false
     }
 
     /// #112 full umbau: sorted insert of a decoded cue into the retained store, keeping ascending start order. An
@@ -1215,36 +1170,6 @@ extension AetherEngine {
                     cues[i] = stamped
                     return true
                 }
-            }
-            // DVB re-transmits an unchanged page every ~0.5-2s with a FRESH
-            // PTS, so the same-start replace above never sees a re-send and
-            // the retained store grew one copy per repetition (55+ live cues
-            // for a single held SD page). A geometry-identical image cue
-            // whose window is still OPEN at the newcomer's start IS the same
-            // on-air page: KEEP the retained cue — its id, image and start
-            // are the page's stable identity — and only extend its window to
-            // the newcomer's. Swapping in the newcomer's cue instead handed
-            // hosts a fresh id + CGImage every re-send, and a SwiftUI overlay
-            // keyed on cue id rebuilt the subtitle image view at ~2Hz over
-            // the video layer — measured 2-4 dropped frames/s, i.e. visible
-            // judder, whenever a page was on screen (2026-08-23 field log).
-            // The window-overlap requirement keeps a later genuine recurrence
-            // (same spot, closed window) a separate cue. Backward scan
-            // bounded by the widest bitmap window the decoder emits (~30s
-            // open-ended DVB placeholder).
-            var i = lower - 1
-            while i >= 0, cues[i].startTime > stamped.startTime - 40 {
-                defer { i -= 1 }
-                guard case .image(let otherImage) = cues[i].body,
-                      cues[i].endTime >= stamped.startTime,
-                      otherImage.position == stampedImage.position,
-                      otherImage.canvasSize == stampedImage.canvasSize,
-                      otherImage.cgImage.width == stampedImage.cgImage.width,
-                      otherImage.cgImage.height == stampedImage.cgImage.height else { continue }
-                if stamped.endTime > cues[i].endTime {
-                    cues[i] = cues[i].with(endTime: stamped.endTime)
-                }
-                return true
             }
         }
         cues.insert(stamped, at: lower)

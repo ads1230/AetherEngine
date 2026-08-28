@@ -7,14 +7,16 @@ import CoreGraphics
 /// on-screen composition from its PTS until the next display set replaces it, an empty set (page
 /// erase) clears it, or the page timeout expires without a refresh. The retained cue store cannot
 /// express that — `alignCueEnds` closes every bitmap cue at the next stored packet's PTS (usually
-/// the first ~0.5-2s re-send), so a held page publishes as a chain of short-window cues with fresh
-/// ids, and every host grew lead/trail/recent-window tolerances plus a silence timeout to
+/// the first ~0.5-2s re-send), so a held page would publish as a chain of short-window cues with
+/// fresh ids, and every host grew lead/trail/recent-window tolerances plus a silence timeout to
 /// reconstruct the page from that tiling. This tracker keeps the page state at the one place the
 /// engine actually knows it: display-set event application. Hosts paint `AetherEngine.dvbSubtitlePage`
 /// verbatim.
 ///
-/// Not a replacement for the retained store: the store still feeds retention, seek backscans and
-/// the PiP compositor. The tracker only answers "what is on screen right now".
+/// The tracker is the ONLY home of decoded DVB bitmaps: page-based cues never enter the retained
+/// store (nothing reads them there — seek backscans re-decode from the packet store, and the
+/// SW-PiP compositor is fed the page via `subtitleCompositorFeedCues`), so a live session no
+/// longer retains a decoded RGBA image per re-send.
 struct DVBSubtitlePageTracker {
     private struct Entry {
         var cue: SubtitleCue
@@ -40,17 +42,17 @@ struct DVBSubtitlePageTracker {
         }
         for newcomer in eventCues {
             guard case .image(let newImage) = newcomer.body else { continue }
-            // Re-send of a region already on screen: identical geometry is the same on-air content
-            // (the fold-in contract from insertCueSorted). Keep the shown cue's id and image so
-            // hosts never re-upload a texture; only the timeout refreshes.
+            // Re-send of a region already on screen: identical geometry (position, canvas, pixel
+            // dims) is the same on-air content. Keep the shown cue's id and image so hosts never
+            // re-upload a texture; only the timeout refreshes.
             if let i = entries.firstIndex(where: { $0.cue.body.matchesGeometry(of: newImage) }) {
                 entries[i].expiresAt = max(entries[i].expiresAt, newcomer.endTime)
                 continue
             }
             // New content replaces whatever it overlaps (a display set is complete page state), but
             // non-overlapping regions survive: SD services emit a two-row sentence as separate
-            // region updates a frame or two apart (see trimDVBBitmapCues), and a purely wholesale
-            // replacement would erase row one when row two arrives.
+            // region updates a frame or two apart, and a purely wholesale replacement would erase
+            // row one when row two arrives.
             entries.removeAll { entry in
                 guard case .image(let shown) = entry.cue.body else { return false }
                 return shown.position.intersects(newImage.position)

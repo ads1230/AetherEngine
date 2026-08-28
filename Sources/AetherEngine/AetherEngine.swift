@@ -557,7 +557,7 @@ public final class AetherEngine: ObservableObject {
         didSet {
             // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
             // window and never double-draw under the fullscreen host overlay.
-            softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive)
+            softwareHost?.updateSubtitleCompositor(cues: subtitleCompositorFeedCues, enabled: pictureInPictureActive)
             #if os(iOS)
             // Auto-PiP ordering isn't guaranteed: didEnterBackground can run
             // before AVKit's willStart, shedding video for a PiP window that
@@ -890,10 +890,10 @@ public final class AetherEngine: ObservableObject {
     /// empty means no page, ids are stable across broadcast re-sends, and the engine owns every
     /// on/off decision — display-set replacement, page erase, the authored page timeout (so an
     /// end-of-programme page clears without a host silence timer), seek reconstruction, and the
-    /// pause-hold contract (a paused clock holds the page). Do NOT window-filter these against the
-    /// playhead and do NOT render page-based image cues out of `subtitleCues`
-    /// (`SubtitleCue.isPageBased` marks them there; their published windows are re-send
-    /// bookkeeping, not visibility).
+    /// pause-hold contract (a paused clock holds the page). Do NOT window-filter these against
+    /// the playhead: the cues' stored windows are decoder bookkeeping, not visibility. This is
+    /// the ONLY channel DVB bitmaps reach a host on — page-based cues never enter `subtitleCues`
+    /// (`SubtitleCue.isPageBased` marks the kind).
     @Published public internal(set) var dvbSubtitlePage: [SubtitleCue] = []
     /// Page state behind `dvbSubtitlePage`, per drained channel; only `.primary` publishes.
     /// Mutated at display-set event application, expired + published once per drain tick.
@@ -2474,11 +2474,6 @@ public final class AetherEngine: ObservableObject {
     /// entry), and select must not replace it with a playhead-anchored parking reader.
     var nativeSubtitleReadersRunToEOF = false
 
-    /// #357: budget for the per-cue `[applySubtitleEvent #N]` line, refilled per seek generation.
-    /// Was a per-load counter, which went blind after 20 events and left every later seek landing
-    /// unobservable; see `SubtitleDeliveryStatement.EventBudget`.
-    var subtitleCueDiagnosticBudget = SubtitleDeliveryStatement.EventBudget()
-
     /// DVB bitmap decoders can emit an event several seconds before its authored display time. The
     /// event has already advanced decoder page state, so the drainer must retain the decoded result
     /// instead of rewinding the cursor or applying future clears early.
@@ -2912,7 +2907,6 @@ public final class AetherEngine: ObservableObject {
         selectedDiscTitle = nil
         discChapters = []
         mediaChapters = []
-        subtitleCueDiagnosticBudget = .init()
         // Reset format/dimension state so paths that skip the probe (nativeRemoteHLS) or find no video
         // don't keep publishing the predecessor's values (e.g. Live TV after an HDR10 film kept reporting .hdr10).
         videoFormat = .sdr

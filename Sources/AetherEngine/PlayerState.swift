@@ -896,10 +896,10 @@ public struct SubtitleImage: @unchecked Sendable {
     /// forced caption (sign / foreign-dialogue overlay shown even with subtitles off).
     public let isForced: Bool
     /// True for page-state formats (DVB): visibility is owned by the engine's page tracker and
-    /// published through `dvbSubtitlePage`, not by this cue's start/end window. The windows the
-    /// retained store publishes for these cues are re-send bookkeeping (a held page tiles into
-    /// short-window cues, see `alignCueEnds`); hosts must exclude page-based image cues from any
-    /// window-scheduled rendering and paint `dvbSubtitlePage` verbatim instead.
+    /// published through `dvbSubtitlePage`, not by this cue's start/end window (the stored window
+    /// is decoder bookkeeping — the page timeout, refreshed by re-sends). Page-based cues never
+    /// enter `subtitleCues`; hosts paint `dvbSubtitlePage` verbatim and window-schedule only
+    /// non-page bitmaps (PGS/DVD).
     public let isPageBased: Bool
 
     public init(cgImage: CGImage, position: CGRect, canvasSize: CGSize = .zero, isForced: Bool = false,
