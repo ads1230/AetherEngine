@@ -65,6 +65,7 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     private var cachedCueIDs: [Int]?
     private var cachedOverlay: CIImage?
     private var loggedFailure = false
+    private var loggedEngaged = false
 
     private lazy var ciContext = CIContext(options: [.cacheIntermediates: false])
     private var pool: CVPixelBufferPool?
@@ -122,20 +123,26 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         // shape — anamorphic SD live TV (720x576 @ 16:9) squashes to 5:4 the
         // moment the first cue composites.
         CVBufferPropagateAttachments(buffer, output)
-        let base = CIImage(cvPixelBuffer: buffer)
-        let composited = overlay.composited(over: base)
-        // Encode into the colorimetry the output's own (just-propagated)
-        // attachments declare. The display decodes composited frames with
-        // those tags, so the encode must match them: a hardcoded 709 target
-        // lightened the whole picture for the lifetime of every DVB cue on
-        // 601-tagged SD live TV (field report 2026-08-28) — the same class
-        // of bug as the PAR drop the propagate call above fixes.
-        let destColorSpace = CVBufferCopyAttachments(output, .shouldPropagate)
+        // Decode and encode through the SAME colorspace, so the video pixels
+        // round-trip as an identity regardless of the buffer's tags. Reading
+        // with CI's default and encoding into a fixed 709 target lightened
+        // the whole picture for the lifetime of every DVB cue (field report
+        // 2026-08-28; bench: UNTAGGED video-range luma bowed +9 at Y=60 with
+        // endpoints pinned — a decode/encode transfer-curve mismatch, the
+        // same class of bug as the PAR drop the propagate call above fixes).
+        // Attachment-derived space when tagged (display decodes with the
+        // tags), 709 otherwise; symmetry, not the specific space, is what
+        // guarantees fidelity — only the overlay's colours ride on the choice.
+        let roundTripSpace = CVBufferCopyAttachments(output, .shouldPropagate)
             .flatMap { CVImageBufferCreateColorSpaceFromAttachments($0)?.takeRetainedValue() }
+            ?? CGColorSpace(name: CGColorSpace.itur_709)!
+        logEngagedOnce(space: roundTripSpace)
+        let base = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: roundTripSpace])
+        let composited = overlay.composited(over: base)
         ciContext.render(
             composited, to: output,
             bounds: CGRect(x: 0, y: 0, width: width, height: height),
-            colorSpace: destColorSpace ?? CGColorSpace(name: CGColorSpace.itur_709)
+            colorSpace: roundTripSpace
         )
         return output
     }
@@ -354,6 +361,22 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         return out
     }
 
+    /// Once per session: names the engine vintage and the colorimetry
+    /// decision in field logs (a stale-package round is otherwise
+    /// indistinguishable — it cost a diagnosis cycle on 2026-08-28).
+    private func logEngagedOnce(space: CGColorSpace) {
+        lock.lock()
+        let first = !loggedEngaged
+        loggedEngaged = true
+        lock.unlock()
+        if first {
+            let name = (space.name as String?) ?? "attachment-derived"
+            EngineLog.emit(
+                "[SubtitleCompositor] engaged (symmetric colorimetry): cs=\(name)",
+                category: .swPlayback)
+        }
+    }
+
     private func logFailureOnce(_ reason: String) {
         lock.lock()
         let first = !loggedFailure
@@ -374,6 +397,7 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         pool = nil
         poolFormat = nil
         loggedFailure = false
+        loggedEngaged = false
         lock.unlock()
     }
 }
