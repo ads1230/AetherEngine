@@ -32,13 +32,13 @@ public final class AetherPlayerView: PlatformBaseView {
     private var hostedLayer: CALayer?
 
     #if canImport(AppKit)
-    /// Owns the hosted layer as its backing layer. AVKit's sample-buffer PiP
-    /// replaces the source layer's owning view with a private bridge view
-    /// added to that view's SUPERVIEW — backing this view directly parked the
-    /// bridge inside NSHostingView, which SwiftUI rejects ("Adding
-    /// 'AVPictureInPicturePlayerLayerView' as a subview of
-    /// NSHostingController.view is not supported"). With an inner child the
-    /// bridge lands in this plain NSView instead.
+    /// Hosts the video layer as a sublayer of its backing layer. Note on
+    /// macOS PiP (probe suite 2026-08-29): PIPAgent MIRRORS the layer 1:1
+    /// wherever it lives — the arrangement does not affect PiP, and the
+    /// "subview of NSHostingController.view" runtime warning is AVKit
+    /// inserting its stand-in at the window's root regardless of nesting
+    /// (benign; not preventable app-side). Sizing for PiP is the pre-size
+    /// contract (`pipOverrideSize`).
     private let layerHostView = NSView()
     #endif
 
@@ -143,14 +143,13 @@ public final class AetherPlayerView: PlatformBaseView {
         self.layer.addSublayer(layer)
         layer.frame = bounds
         #elseif canImport(AppKit)
-        // Plain SUBLAYER of layerHostView, deliberately NOT its backing
-        // layer: AVKit's PiP adopts the source layer into its own
-        // DisplayLayerView (that is what scales it for the window), and a
-        // view-BACKING layer is AppKit-owned — the adoption failed silently
-        // and the PiP window mirrored the unmoved, unscaled layer as a crop
-        // (probe 2026-08-29: superlayer never changed through a session).
-        // layerHostView still keeps AVKit's bridge insertion below the
-        // SwiftUI hosting view (the cffb3204 arrangement).
+        // Plain sublayer of layerHostView. macOS PiP never touches the layer
+        // at all — PIPAgent MIRRORS it 1:1 wherever it lives, with the
+        // mapping captured at startPictureInPicture (probe suite 2026-08-29:
+        // sublayer / backing-layer / fully-detached arrangements behave
+        // identically) — so the arrangement is chosen for simplicity, and
+        // sizing for PiP is the pre-size contract (see pipOverrideSize and
+        // AetherEngine.prepareMacPiPStart).
         layerHostView.frame = bounds
         layerHostView.wantsLayer = true
         layerHostView.layer?.addSublayer(layer)
@@ -227,38 +226,21 @@ public struct AetherPlayerSurface: NSViewRepresentable {
         self.engine = engine
     }
 
-    public func makeNSView(context: Context) -> NSView {
-        // Plain container between AetherPlayerView and SwiftUI: macOS PiP
-        // inserts its stand-in views (AVPictureInPicturePlayerLayerView /
-        // AVPictureInPictureSampleBufferDisplayLayerView) into superviews of
-        // the video hosting chain, and SwiftUI mounts a representable's view
-        // DIRECTLY inside NSHostingView — so the player view's own superview
-        // was the hosting view and startPictureInPicture tripped SwiftUI's
-        // "not supported as a subview of NSHostingController.view" runtime
-        // issue (field report 2026-08-28). With this level plus the inner
-        // layerHostView, every AVKit insertion point is a plain NSView.
-        let container = NSView()
-        container.wantsLayer = true
-        container.layer?.backgroundColor = CGColor.black
+    public func makeNSView(context: Context) -> AetherPlayerView {
         let view = AetherPlayerView()
-        view.frame = container.bounds
-        view.autoresizingMask = [.width, .height]
-        container.addSubview(view)
         engine.bind(view: view)
-        return container
+        return view
     }
 
-    public func updateNSView(_ nsView: NSView, context: Context) {
+    public func updateNSView(_ nsView: AetherPlayerView, context: Context) {
         // #188: rebind on update so an engine swap at the same structural position
         // takes over the reused view. Idempotent for the steady-state case.
-        guard let view = nsView.subviews.compactMap({ $0 as? AetherPlayerView }).first else { return }
-        engine.bind(view: view)
+        engine.bind(view: nsView)
     }
 
-    public static func dismantleNSView(_ nsView: NSView, coordinator: ()) {
-        let view = nsView.subviews.compactMap({ $0 as? AetherPlayerView }).first
+    public static func dismantleNSView(_ nsView: AetherPlayerView, coordinator: ()) {
         Task { @MainActor in
-            view?.detach()
+            nsView.detach()
         }
     }
 }
