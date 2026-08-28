@@ -601,6 +601,22 @@ public final class AetherEngine: ObservableObject {
                 softwareHost?.beginPiPHandoffWindow()
             }
             #if os(macOS)
+            // Adoption check: with the layer hosted as a plain sublayer
+            // (2026-08-29), AVKit should take it into its DisplayLayerView —
+            // these lines prove or refute that in the field log.
+            if pictureInPictureActive && !oldValue {
+                Task { @MainActor [weak self] in
+                    for probe in 1...3 {
+                        guard let self, self.pictureInPictureActive else { return }
+                        if let view = self.boundView {
+                            EngineLog.emit(
+                                "[AetherEngine] macOS PiP adopt probe #\(probe): \(view.describeHostedLayerForPiP())",
+                                category: .engine)
+                        }
+                        try? await Task.sleep(for: .milliseconds(600))
+                    }
+                }
+            }
             // PiP over: drop the render-size override so the layer returns
             // to the view's own bounds (see setPiPRenderSize).
             if oldValue && !pictureInPictureActive {

@@ -116,16 +116,32 @@ public final class AetherPlayerView: PlatformBaseView {
         #if canImport(AppKit)
         let target = pipOverrideSize.map { CGRect(origin: .zero, size: $0) } ?? bounds
         layerHostView.frame = target
-        if hosted === layerHostView.layer {
-            hosted.bounds = layerHostView.bounds
-        } else {
-            hosted.frame = target
+        // Only size the layer while it lives in our tree — once AVKit adopts
+        // it into its PiP DisplayLayerView, geometry belongs to AVKit.
+        if hosted.superlayer === layerHostView.layer || hosted.superlayer == nil {
+            hosted.frame = layerHostView.bounds
         }
         #else
         hosted.frame = bounds
         #endif
         CATransaction.commit()
     }
+
+    #if canImport(AppKit)
+    /// Engine-internal diagnostic: where the hosted layer lives (adoption
+    /// check for macOS PiP).
+    func describeHostedLayerForPiP() -> String {
+        guard let hosted = hostedLayer else { return "hosted=nil" }
+        let sup = hosted.superlayer
+        let supName = sup.map { String(describing: type(of: $0)) } ?? "nil"
+        let supDelegate = (sup?.delegate).map { String(describing: type(of: $0)) } ?? "nil"
+        return String(
+            format: "frame=%@ super=%@ superDelegate=%@ inOurTree=%d",
+            NSStringFromRect(hosted.frame), supName, supDelegate,
+            (sup === layerHostView.layer) ? 1 : 0
+        )
+    }
+    #endif
 
     // MARK: - Engine-only attachment
 
@@ -142,15 +158,18 @@ public final class AetherPlayerView: PlatformBaseView {
         self.layer.addSublayer(layer)
         layer.frame = bounds
         #elseif canImport(AppKit)
-        // macOS PiP's sample-buffer path expects the source layer to be owned
-        // by a real NSView — and NOT by this view itself: AVKit inserts its
-        // PiP bridge view into the owning view's superview, so the owner must
-        // sit below a plain NSView (see layerHostView).
+        // Plain SUBLAYER of layerHostView, deliberately NOT its backing
+        // layer: AVKit's PiP adopts the source layer into its own
+        // DisplayLayerView (that is what scales it for the window), and a
+        // view-BACKING layer is AppKit-owned — the adoption failed silently
+        // and the PiP window mirrored the unmoved, unscaled layer as a crop
+        // (probe 2026-08-29: superlayer never changed through a session).
+        // layerHostView still keeps AVKit's bridge insertion below the
+        // SwiftUI hosting view (the cffb3204 arrangement).
         layerHostView.frame = bounds
-        layerHostView.layer = layer
         layerHostView.wantsLayer = true
-        layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        layer.bounds = layerHostView.bounds
+        layerHostView.layer?.addSublayer(layer)
+        layer.frame = layerHostView.bounds
         #endif
         hostedLayer = layer
         CATransaction.commit()
@@ -162,17 +181,7 @@ public final class AetherPlayerView: PlatformBaseView {
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        #if canImport(AppKit)
-        if hosted === layerHostView.layer {
-            let blankLayer = CALayer()
-            blankLayer.backgroundColor = CGColor.black
-            layerHostView.layer = blankLayer
-        } else {
-            hosted.removeFromSuperlayer()
-        }
-        #else
         hosted.removeFromSuperlayer()
-        #endif
         hostedLayer = nil
         CATransaction.commit()
     }
