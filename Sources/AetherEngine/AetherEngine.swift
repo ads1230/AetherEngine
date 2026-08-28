@@ -567,13 +567,13 @@ public final class AetherEngine: ObservableObject {
             if pictureInPictureActive && !oldValue && isBackgrounded {
                 softwareHost?.exitBackgroundAudioOnly()
             }
+            #endif
             // Bridge AVKit's layer re-host with display-immediately frames;
             // the synchronizer clock stalls during the re-host (see
             // SampleBufferRenderer.beginPiPHandoffWindow).
             if pictureInPictureActive && !oldValue {
                 softwareHost?.beginPiPHandoffWindow()
             }
-            #endif
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the
             // wedge-safe teardown now, before idle suspension (mirrors the iOS pause-while-backgrounded path).
