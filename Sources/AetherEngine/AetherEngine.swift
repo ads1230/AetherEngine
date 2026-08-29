@@ -552,60 +552,34 @@ public final class AetherEngine: ObservableObject {
         }
     }
     #if os(macOS)
-    private static let macPiPWindowSizeKey = "AetherEngine.macPiPWindowSize"
-    private var macPiPWindowPollTask: Task<Void, Never>?
+    /// The public sample-buffer PiP on macOS mirrors the layer 1:1 without
+    /// scaling (OS bug; probe suite 2026-08-29 + developer forums) — the host
+    /// presents PiP via the private PIPViewController instead, which
+    /// REPARENTS a real view. While it does, the video layer moves into the
+    /// PiP panel's own AetherPlayerView; app-side binds (the SwiftUI surface
+    /// rebinds on every update) are deferred here and restored on end.
+    private weak var macPiPRestoreView: AetherPlayerView?
+    public private(set) var macPiPHostingActive = false
 
-    /// Call BEFORE `startPictureInPicture`. macOS PiP (PIPAgent) captures the
-    /// layer's geometry AT START and mirrors it 1:1 into its window from then
-    /// on — probe suite 2026-08-29: post-start resizes render at the captured
-    /// size (broken mapping), a layer smaller than the window shows whole but
-    /// 1:1 with margins, a layer AT window size fills correctly. PIPAgent
-    /// remembers its window size across sessions, so the layer is pre-sized
-    /// to the persisted last-known window size (polled while PiP runs); the
-    /// first-ever session falls back to a modest 16:9 that under-fills
-    /// rather than crops and self-heals once a real size is persisted.
-    public func prepareMacPiPStart() {
-        // Measured mirror contract (probe suite 2026-08-29, colored-border
-        // test pattern, screenshot-verified at the live window size): the
-        // PiP agent renders the layer 1:1 — never scaling — anchored ~(28, 4)
-        // from the window's BOTTOM-LEFT, clipping whatever exceeds the
-        // window; the window itself is purely the user's remembered size.
-        // So: aspect-fit the video inside the persisted window minus the
-        // anchor insets plus slack — complete picture, near-full window.
-        var window = CGSize(width: 640, height: 360)
-        if let stored = UserDefaults.standard.string(forKey: Self.macPiPWindowSizeKey) {
-            let parsed = NSSizeFromString(stored)
-            if parsed.width > 50, parsed.height > 50 { window = parsed }
-        }
-        var aspect: CGFloat = 16.0 / 9.0
-        if let display = softwareDisplaySize, display.width > 0, display.height > 0 {
-            aspect = display.width / display.height
-        }
-        let boxWidth = max(160, window.width - 36)
-        let boxHeight = max(90, window.height - 12)
-        let fitWidth = min(boxWidth, boxHeight * aspect)
-        let size = CGSize(width: fitWidth.rounded(), height: (fitWidth / aspect).rounded())
-        EngineLog.emit(
-            "[AetherEngine] macOS PiP pre-size \(Int(size.width))x\(Int(size.height)) (fit in \(Int(window.width))x\(Int(window.height)))",
-            category: .engine)
-        boundView?.setPiPOverrideSize(size)
+    public func beginMacPiPHosting(in view: AetherPlayerView) {
+        macPiPRestoreView = boundView
+        macPiPHostingActive = true
+        if let existing = boundView, existing !== view { existing.detach() }
+        boundView = view
+        presentCurrentLayer()
+        EngineLog.emit("[AetherEngine] macOS PiP hosting began (private PIPViewController)", category: .engine)
     }
 
-    /// The PiP window's on-screen size, via the window list (owner
-    /// "Picture in Picture"); bounds don't require capture permission.
-    private static func macPiPWindowSize() -> CGSize? {
-        guard let info = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return nil
+    public func endMacPiPHosting() {
+        guard macPiPHostingActive else { return }
+        macPiPHostingActive = false
+        boundView?.detach()
+        boundView = nil
+        if let restore = macPiPRestoreView {
+            bind(view: restore)
         }
-        for window in info {
-            guard (window[kCGWindowOwnerName as String] as? String) == "Picture in Picture",
-                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat],
-                  let width = bounds["Width"], let height = bounds["Height"],
-                  width > 50, height > 50 else { continue }
-            return CGSize(width: width, height: height)
-        }
-        return nil
+        macPiPRestoreView = nil
+        EngineLog.emit("[AetherEngine] macOS PiP hosting ended", category: .engine)
     }
     #endif
     /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
@@ -642,30 +616,6 @@ public final class AetherEngine: ObservableObject {
             if pictureInPictureActive && !oldValue {
                 softwareHost?.beginPiPHandoffWindow()
             }
-            #if os(macOS)
-            // While PiP runs, remember the window's size for the NEXT
-            // session's pre-size (see prepareMacPiPStart) — never resize the
-            // layer mid-session, the agent's mapping is fixed at start.
-            if pictureInPictureActive && !oldValue {
-                macPiPWindowPollTask?.cancel()
-                macPiPWindowPollTask = Task { @MainActor [weak self] in
-                    while let self, self.pictureInPictureActive, !Task.isCancelled {
-                        if let size = Self.macPiPWindowSize() {
-                            UserDefaults.standard.set(
-                                NSStringFromSize(size), forKey: Self.macPiPWindowSizeKey)
-                        }
-                        try? await Task.sleep(for: .seconds(1))
-                    }
-                }
-            }
-            // PiP over: drop the pre-size override so the layer returns to
-            // the view's own bounds.
-            if oldValue && !pictureInPictureActive {
-                macPiPWindowPollTask?.cancel()
-                macPiPWindowPollTask = nil
-                boundView?.setPiPOverrideSize(nil)
-            }
-            #endif
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the
             // wedge-safe teardown now, before idle suspension (mirrors the iOS pause-while-backgrounded path).
@@ -1271,6 +1221,15 @@ public final class AetherEngine: ObservableObject {
     /// Bind a render surface. Attaches the active layer immediately; re-attaches on session swaps.
     /// Binding a different view detaches the old one.
     public func bind(view: AetherPlayerView) {
+        #if os(macOS)
+        // The PiP panel owns the layer while private-PiP hosting is active;
+        // remember the app-side view for the restore instead of stealing the
+        // layer back mid-session (the SwiftUI surface rebinds on updates).
+        if macPiPHostingActive, view !== boundView {
+            macPiPRestoreView = view
+            return
+        }
+        #endif
         if let existing = boundView, existing !== view {
             existing.detach()
         }

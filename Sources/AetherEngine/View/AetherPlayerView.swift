@@ -92,35 +92,13 @@ public final class AetherPlayerView: PlatformBaseView {
     }
     #endif
 
-    #if canImport(AppKit)
-    /// macOS AVKit PiP MIRRORS the sample-buffer layer without reparenting or
-    /// resizing it (probe 2026-08-29: the layer stays this view's subtree at
-    /// app-window bounds through the whole session, so the window showed an
-    /// unscaled crop). The sizing contract is the render-size delegate
-    /// callback: while set, the layer renders at AVKit's requested size and
-    /// the mirror shows the whole frame.
-    private var pipOverrideSize: CGSize?
-
-    /// Engine-internal: AVKit's PiP render size (nil = PiP over, back to the
-    /// view's own bounds).
-    func setPiPOverrideSize(_ size: CGSize?) {
-        pipOverrideSize = size
-        applyLayerFrame()
-    }
-    #endif
-
     private func applyLayerFrame() {
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         #if canImport(AppKit)
-        let target = pipOverrideSize.map { CGRect(origin: .zero, size: $0) } ?? bounds
-        layerHostView.frame = target
-        // Only size the layer while it lives in our tree — once AVKit adopts
-        // it into its PiP DisplayLayerView, geometry belongs to AVKit.
-        if hosted.superlayer === layerHostView.layer || hosted.superlayer == nil {
-            hosted.frame = layerHostView.bounds
-        }
+        layerHostView.frame = bounds
+        hosted.frame = layerHostView.bounds
         #else
         hosted.frame = bounds
         #endif
