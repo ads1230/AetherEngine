@@ -565,24 +565,28 @@ public final class AetherEngine: ObservableObject {
     /// first-ever session falls back to a modest 16:9 that under-fills
     /// rather than crops and self-heals once a real size is persisted.
     public func prepareMacPiPStart() {
-        var width: CGFloat = 576
+        // Measured mirror contract (probe suite 2026-08-29, colored-border
+        // test pattern, screenshot-verified at the live window size): the
+        // PiP agent renders the layer 1:1 — never scaling — anchored ~(28, 4)
+        // from the window's BOTTOM-LEFT, clipping whatever exceeds the
+        // window; the window itself is purely the user's remembered size.
+        // So: aspect-fit the video inside the persisted window minus the
+        // anchor insets plus slack — complete picture, near-full window.
+        var window = CGSize(width: 640, height: 360)
         if let stored = UserDefaults.standard.string(forKey: Self.macPiPWindowSizeKey) {
             let parsed = NSSizeFromString(stored)
-            if parsed.width > 50 { width = parsed.width }
+            if parsed.width > 50, parsed.height > 50 { window = parsed }
         }
-        // Height from the VIDEO's aspect, not the persisted window's: the
-        // mirror maps the layer's videoRect to the window fill-width and
-        // bottom-anchored, so any aspect mismatch between them trims the TOP
-        // (field 2026-08-29: 910x493 window vs 16:9 video). With the layer at
-        // the video's aspect, videoRect == layer, AVKit shapes the window
-        // from the source's aspect, and the mapping is uniform.
         var aspect: CGFloat = 16.0 / 9.0
         if let display = softwareDisplaySize, display.width > 0, display.height > 0 {
             aspect = display.width / display.height
         }
-        let size = CGSize(width: width.rounded(), height: (width / aspect).rounded())
+        let boxWidth = max(160, window.width - 36)
+        let boxHeight = max(90, window.height - 12)
+        let fitWidth = min(boxWidth, boxHeight * aspect)
+        let size = CGSize(width: fitWidth.rounded(), height: (fitWidth / aspect).rounded())
         EngineLog.emit(
-            "[AetherEngine] macOS PiP pre-size \(Int(size.width))x\(Int(size.height)) (video aspect)",
+            "[AetherEngine] macOS PiP pre-size \(Int(size.width))x\(Int(size.height)) (fit in \(Int(window.width))x\(Int(window.height)))",
             category: .engine)
         boundView?.setPiPOverrideSize(size)
     }
