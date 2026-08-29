@@ -510,6 +510,23 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Callback handling (called from VT's queue)
 
+    /// #397: output-callback failures throttled to the first and every 250th so a per-field
+    /// failure mode (interlaced H.264 that slipped past the selection gate) is visible without
+    /// flooding. Called on VT's queue; counter under skipLock (same discipline as onFrame).
+    private var outputErrorCount = 0
+    fileprivate func noteOutputError(status: OSStatus) {
+        skipLock.lock()
+        outputErrorCount += 1
+        let count = outputErrorCount
+        skipLock.unlock()
+        if count == 1 || count % 250 == 0 {
+            EngineLog.emit(
+                "[HardwareVideoDecoder] output callback error \(status) (count=\(count))",
+                category: .swPlayback
+            )
+        }
+    }
+
     /// Invoked by `hwDecoderOutputCallback`; delivers CVPixelBuffer+PTS, honouring `skipUntilPTS` for seek-pre-roll.
     fileprivate func handleDecodedFrame(
         imageBuffer: CVImageBuffer,
@@ -597,10 +614,18 @@ private func hwDecoderOutputCallback(
     presentationTimeStamp: CMTime,
     presentationDuration: CMTime
 ) {
-    guard status == noErr, let imageBuffer = imageBuffer else { return }
     guard let refCon = decompressionOutputRefCon else { return }
     let box = Unmanaged<HardwareVideoDecoder.RefConBox>
         .fromOpaque(refCon).takeUnretainedValue()
+    guard status == noErr, let imageBuffer = imageBuffer else {
+        // #397: these were dropped silently, which made a VT session that opened on
+        // interlaced H.264 and then failed every field picture indistinguishable from a
+        // healthy one in the logs (multi-second enq=+0 freezes with zero error lines).
+        if status != noErr {
+            box.decoder?.noteOutputError(status: status)
+        }
+        return
+    }
     box.decoder?.handleDecodedFrame(
         imageBuffer: imageBuffer,
         pts: presentationTimeStamp

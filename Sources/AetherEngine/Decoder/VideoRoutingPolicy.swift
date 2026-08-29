@@ -68,6 +68,28 @@ enum VideoRoutingPolicy {
         return H264SPS.frameMbsOnly(fromNAL: sps) == false
     }
 
+    /// #397: the software host's in-path VT decoder (HardwareVideoDecoder) must never host
+    /// interlaced H.264. Two independent reasons, both field-proven on HDHomeRun 1080i25
+    /// (Channel 4 HD freeze log, 2026-08-29): (1) macOS VT usually refuses the session outright
+    /// (-12911), but the refusal is nondeterministic — a session that opens during a frame-coded
+    /// stretch then stalls SILENTLY on field-coded pictures (multi-second output-callback gaps,
+    /// late-burst frame dumps, climbing layerDrop = frozen video under a running audio clock);
+    /// (2) HardwareVideoDecoder has no deinterlacer — only SoftwareVideoDecoder engages
+    /// DeinterlaceFilter — so even a VT decode that worked would comb. Same evidence rules as
+    /// #107/#150: declared interlaced field order, or field order UNKNOWN with SPS
+    /// frame_mbs_only_flag == 0. A false positive costs an unnecessary libavcodec decode (the
+    /// #107 trade); a false negative is the frozen-video session.
+    static func vtInPathDecoderUnsuitable(
+        codecID: AVCodecID,
+        fieldOrder: AVFieldOrder,
+        extradata: [UInt8]?
+    ) -> Bool {
+        guard codecID == AV_CODEC_ID_H264 else { return false }
+        if interlacedFieldOrders.contains(fieldOrder) { return true }
+        guard fieldOrder == AV_FIELD_UNKNOWN, let extradata else { return false }
+        return spsIndicatesInterlaced(extradata: extradata)
+    }
+
     /// Second-stage gate (#2): a codec that passed `requiresSoftwarePath` as native (H.264 / HEVC) but whose
     /// specific format VideoToolbox cannot HARDWARE-decode must still fall back to software, or the native
     /// AVPlayer path reaches readyToPlay and then renders nothing (H.264 High 4:2:2/4:4:4/High-10, HEVC Rext

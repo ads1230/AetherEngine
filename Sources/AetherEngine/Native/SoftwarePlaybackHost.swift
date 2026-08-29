@@ -698,6 +698,31 @@ final class SoftwarePlaybackHost {
         return -1
     }
 
+    /// #397 gate at decoder selection: interlaced H.264 stays on SoftwareVideoDecoder. The
+    /// decision itself is pure and tested (VideoRoutingPolicy.vtInPathDecoderUnsuitable); this
+    /// wrapper extracts field order + extradata from codecpar and logs when the gate fires.
+    nonisolated static func interlaceExcludesVTDecoder(
+        codecpar: UnsafePointer<AVCodecParameters>
+    ) -> Bool {
+        var extradata: [UInt8]?
+        if let bytes = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
+            extradata = Array(UnsafeBufferPointer(start: bytes, count: Int(codecpar.pointee.extradata_size)))
+        }
+        let unsuitable = VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: codecpar.pointee.codec_id,
+            fieldOrder: codecpar.pointee.field_order,
+            extradata: extradata
+        )
+        if unsuitable {
+            EngineLog.emit(
+                "[SWHost] interlaced H.264 (fieldOrder=\(codecpar.pointee.field_order.rawValue)): "
+                + "keeping SoftwareVideoDecoder — VT stalls on field pictures and has no deinterlacer (#397)",
+                category: .swPlayback
+            )
+        }
+        return unsuitable
+    }
+
     /// True when a live-MPEG-TS AAC stream needs codecpar repair before the decoder opens: the probe
     /// left `sample_rate=0`. Mirrors HLSVideoEngine's native repair (fill 48 kHz stereo AAC-LC). VOD
     /// probes the whole file, so its codecpar is trusted and never repaired.
@@ -825,8 +850,11 @@ final class SoftwarePlaybackHost {
         // black screen. Route those to libavcodec instead, which decodes them. Apple Silicon HW-decodes them,
         // so the probe keeps HardwareVideoDecoder there. Live HD H.264 also needs this route: it keeps the
         // fast direct demux/render startup without paying the steady-state cost of libavcodec 1080 decode.
+        // #397: interlaced H.264 (1080i broadcast) is excluded — VT stalls silently on field pictures
+        // when the session even opens, and HardwareVideoDecoder has no deinterlacer.
         if let codecpar = vStream.pointee.codecpar,
            (codecpar.pointee.codec_id == AV_CODEC_ID_H264 || codecpar.pointee.codec_id == AV_CODEC_ID_HEVC),
+           !Self.interlaceExcludesVTDecoder(codecpar: codecpar),
            VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) {
             videoDecoder.close()
             videoDecoder = HardwareVideoDecoder()

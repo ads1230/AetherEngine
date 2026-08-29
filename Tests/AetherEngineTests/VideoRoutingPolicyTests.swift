@@ -130,6 +130,62 @@ struct VideoRoutingPolicyTests {
         #expect(!VideoRoutingPolicy.spsIndicatesInterlaced(extradata: [0xde, 0xad]))
     }
 
+    // MARK: - #397 in-path VT decoder exclusion for interlaced H.264
+
+    @Test("declared interlaced H.264 excludes the in-path VT decoder")
+    func interlacedH264ExcludesVT() {
+        for order in [AV_FIELD_TT, AV_FIELD_BB, AV_FIELD_TB, AV_FIELD_BT] {
+            #expect(VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+                codecID: AV_CODEC_ID_H264, fieldOrder: order, extradata: nil))
+        }
+    }
+
+    @Test("UNKNOWN field order consults the SPS (the C4HD 1080i freeze shape)")
+    func unknownFieldOrderConsultsSPS() {
+        // Annex-B extradata as MPEG-TS live delivers it — the same bytes VT built its
+        // session from in the 2026-08-29 freeze log.
+        let sc: [UInt8] = [0, 0, 0, 1]
+        let spsInterlaced: [UInt8] = [0x67, 0x4d, 0x40, 0x28, 0xec, 0xa0, 0x3c, 0x02, 0x23, 0xed]
+        let pps: [UInt8] = [0x68, 0xef, 0xbc, 0xb0]
+        #expect(VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: AV_CODEC_ID_H264, fieldOrder: AV_FIELD_UNKNOWN,
+            extradata: sc + spsInterlaced + sc + pps))
+    }
+
+    @Test("progressive H.264 keeps the VT decoder (Xtream 1080p live stays fast)")
+    func progressiveH264KeepsVT() {
+        let sc: [UInt8] = [0, 0, 0, 1]
+        let spsProgressive: [UInt8] = [
+            0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xbb, 0x01, 0x6a, 0x02, 0x04,
+            0x02, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x8c, 0x18, 0xcb,
+        ]
+        #expect(!VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: AV_CODEC_ID_H264, fieldOrder: AV_FIELD_PROGRESSIVE, extradata: nil))
+        #expect(!VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: AV_CODEC_ID_H264, fieldOrder: AV_FIELD_UNKNOWN,
+            extradata: sc + spsProgressive))
+        // A concrete PROGRESSIVE declaration wins even over an interlace-capable SPS
+        // (same #232 reasoning as the routing layer).
+        let spsInterlaced: [UInt8] = [0x67, 0x4d, 0x40, 0x28, 0xec, 0xa0, 0x3c, 0x02, 0x23, 0xed]
+        #expect(!VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: AV_CODEC_ID_H264, fieldOrder: AV_FIELD_PROGRESSIVE,
+            extradata: sc + spsInterlaced))
+    }
+
+    @Test("UNKNOWN field order with missing or unparseable extradata keeps VT")
+    func unknownWithoutEvidenceKeepsVT() {
+        #expect(!VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: AV_CODEC_ID_H264, fieldOrder: AV_FIELD_UNKNOWN, extradata: nil))
+        #expect(!VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: AV_CODEC_ID_H264, fieldOrder: AV_FIELD_UNKNOWN, extradata: [0xde, 0xad]))
+    }
+
+    @Test("HEVC never trips the interlace VT exclusion (broadcast HEVC is progressive)")
+    func hevcIgnoresInterlaceVTExclusion() {
+        #expect(!VideoRoutingPolicy.vtInPathDecoderUnsuitable(
+            codecID: AV_CODEC_ID_HEVC, fieldOrder: AV_FIELD_TT, extradata: nil))
+    }
+
     // MARK: - #2 undecodable-format second-stage gate
 
     @Test("H.264 / HEVC that VideoToolbox can't HW-decode falls back to software")
