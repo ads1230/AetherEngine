@@ -670,11 +670,21 @@ final class EmbeddedSubtitleDecoder {
 
         // Re-crop to non-zero-alpha bounding box: some Blu-ray-to-MKV conversions emit full 1920x1080 ODS bitmaps
         // with cropping params that FFmpeg's pgssubdec discards, carrying ~8 MB of transparent pixels per cue.
+        //
+        // Both pixel loops are deliberately `while` loops over raw pointers /
+        // an unsafe buffer: Range iteration and Array subscripts compile to
+        // accessor coroutines + retain traffic at -Onone, and a full-frame
+        // DVB region (up to 1920x1080 = 2M pixels x 2 passes) took 0.6-2s
+        // PER CUE in debug builds — starving the render clock into visible
+        // jerks, clock-jump "replays" and audio rebuffers on HDHomeRun
+        // channels (field 2026-09-04, MAIN-HANG stacks in subtitleDrainTick).
         let alphaThreshold: UInt8 = 8
         var minX = width, minY = height, maxX = -1, maxY = -1
-        for y in 0..<height {
+        var y = 0
+        while y < height {
             let rowOff = y * stride
-            for x in 0..<width {
+            var x = 0
+            while x < width {
                 let palIdx = Int(pixelsPtr[rowOff + x])
                 let alpha = palettePtr[palIdx * 4 + 3]
                 if alpha >= alphaThreshold {
@@ -683,7 +693,9 @@ final class EmbeddedSubtitleDecoder {
                     if x > maxX { maxX = x }
                     if y > maxY { maxY = y }
                 }
+                x += 1
             }
+            y += 1
         }
         guard maxX >= minX, maxY >= minY else { return nil }
 
@@ -693,22 +705,29 @@ final class EmbeddedSubtitleDecoder {
         let absY = Int(r.y) + minY
 
         var rgba = [UInt8](repeating: 0, count: cropW * cropH * 4)
-        for cy in 0..<cropH {
-            let srcRow = (minY + cy) * stride
-            let dstRow = cy * cropW * 4
-            for cx in 0..<cropW {
-                let palIdx = Int(pixelsPtr[srcRow + minX + cx])
-                let palOff = palIdx * 4
-                let b = palettePtr[palOff + 0]
-                let g = palettePtr[palOff + 1]
-                let red = palettePtr[palOff + 2]
-                let a = palettePtr[palOff + 3]
-                // Premultiply: straight alpha produces black-fringe edges in CGImage premultipliedLast.
-                let outOff = dstRow + cx * 4
-                rgba[outOff + 0] = UInt8((Int(red) * Int(a) + 127) / 255)
-                rgba[outOff + 1] = UInt8((Int(g) * Int(a) + 127) / 255)
-                rgba[outOff + 2] = UInt8((Int(b) * Int(a) + 127) / 255)
-                rgba[outOff + 3] = a
+        rgba.withUnsafeMutableBufferPointer { out in
+            var cy = 0
+            while cy < cropH {
+                let srcRow = (minY + cy) * stride
+                let dstRow = cy * cropW * 4
+                var cx = 0
+                while cx < cropW {
+                    let palIdx = Int(pixelsPtr[srcRow + minX + cx])
+                    let palOff = palIdx * 4
+                    let b = palettePtr[palOff + 0]
+                    let g = palettePtr[palOff + 1]
+                    let red = palettePtr[palOff + 2]
+                    let a = palettePtr[palOff + 3]
+                    // Premultiply: straight alpha produces black-fringe edges in CGImage premultipliedLast.
+                    let alpha = Int(a)
+                    let outOff = dstRow + cx * 4
+                    out[outOff + 0] = UInt8((Int(red) * alpha + 127) / 255)
+                    out[outOff + 1] = UInt8((Int(g) * alpha + 127) / 255)
+                    out[outOff + 2] = UInt8((Int(b) * alpha + 127) / 255)
+                    out[outOff + 3] = a
+                    cx += 1
+                }
+                cy += 1
             }
         }
 
