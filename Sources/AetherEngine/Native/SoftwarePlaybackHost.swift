@@ -1882,7 +1882,7 @@ final class SoftwarePlaybackHost {
             }
             let lastPTS = audioLookahead.lastFedAudioPTS
             let audioLead = lastPTS.isFinite ? lastPTS - aOut.currentTimeSeconds : 0
-            let audioPrimed = audioStreamIndex < 0 || audioLead >= AudioLookaheadPolicy.rebufferResumeLeadSeconds
+            let audioPrimed = audioStreamIndex < 0 || audioLead >= AudioLookaheadPolicy.seekPrimeAudioLeadSeconds
             guard (ready && deadlineReached(videoPrimeReadyAfter, now: now))
                     && audioPrimed
                     || deadlineReached(videoPrimeForceResumeAfter, now: now) else { return }
@@ -2541,7 +2541,7 @@ final class SoftwarePlaybackHost {
                 if isPlaying() { aOut.setRate(currentRate()) }
                 return
             }
-            if lead >= AudioLookaheadPolicy.rebufferResumeLeadSeconds { everHadLead = true }
+            if lead >= AudioLookaheadPolicy.seekPrimeAudioLeadSeconds { everHadLead = true }
             guard everHadLead, isPlaying() || rebuffering else { return }
             switch AudioLookaheadPolicy.clockAction(
                 rebuffering: rebuffering,

@@ -30,7 +30,19 @@ enum AudioLookaheadPolicy {
     /// chopping that never recovers). Pause the clock and rebuffer instead, exactly like the
     /// native path's AVPlayer stall handling.
     static let underrunPauseLeadSeconds = 0.15
-    static let rebufferResumeLeadSeconds = 2.0
+    /// Post-underrun refill target. 3s, not 2: low-bitrate broadcast muxes
+    /// (SD ≈ 1 Mbps) arrive from HDHomeRun-style origins in ~2s chunks — the
+    /// reader's 256KB granule IS ~2s of content — so a 2s setpoint sat at the
+    /// chunk cadence and the lead sawtooth bottomed out roughly once a minute
+    /// (0.4s pause; field 2026-09-04, healthy Ethernet, reconnects=0). One
+    /// chunk of extra headroom keeps the trough above the pause threshold.
+    /// Burst-backlog refills mean the deeper target costs ~0.5s once per
+    /// underrun, not per minute. Must stay below targetLeadSeconds.
+    static let rebufferResumeLeadSeconds = 3.0
+    /// Post-seek video-prime "audio primed" gate and the everHadLead latch
+    /// keep the OLD threshold: gating seek resume (or the latch) on the
+    /// deeper live refill would delay every VOD seek instead.
+    static let seekPrimeAudioLeadSeconds = 2.0
 
     enum ClockAction: Equatable {
         case none
