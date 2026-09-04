@@ -53,19 +53,49 @@ final class SampleBufferRenderer: @unchecked Sendable {
     // the entire point of the cushion. `cushionCapFrames` is the memory bound
     // (1080p NV12 ≈ 3.1MB/frame): beyond it the oldest frame force-flushes to
     // the layer exactly like the old overflow rule.
+    // Byte-budgeted, not frame-counted: the budgets equal the old per-platform
+    // frame tiers at 1080p NV12 (~3.13MB/frame), so HD behavior is unchanged —
+    // but SD frames are ~6x smaller, and the frame-counted tiers left SD
+    // channels the same ~1s of wall-clock cover that 1080p gets from the SAME
+    // memory. Bursty tuners (HDHomeRun over congested links: 1-2.2s arrival
+    // gaps, field 2026-09-04) outlasted that on SD — video ran dry while the
+    // audio lead survived, then the catch-up burst dropped late frames
+    // (layerDrop +20/s spikes = visible jerk). Budgeting bytes gives SD ~4-5s
+    // from the same footprint; a live source self-limits the fill to however
+    // far arrival runs ahead of the clock. Frame clamps bound tiny-frame
+    // pathologies (thumbnail-sized streams) and keep the floor at the old
+    // tier so an early oversized data-size read can never shrink HD below it.
     #if os(macOS)
-    private let cushionTargetFrames = 32   // ~1.3s @25fps, ~0.6s @50fps, ≈100MB worst case
-    private let cushionCapFrames = 48
+    private let cushionTargetBytes = 100 << 20   // ≈32 frames at 1080p
+    private let cushionCapBytes = 150 << 20      // ≈48 frames at 1080p
+    private let cushionMinTargetFrames = 32
     #elseif os(tvOS)
     // Apple TV 4K has 3-4GB and no phone-grade jetsam pressure, and its live
     // tuner channels ALWAYS take the software route (the app forces it so
     // 1080i gets deinterlaced) — it needs the full cushion as much as the Mac.
-    private let cushionTargetFrames = 24   // ~1.0s @25fps, ≈75MB worst case at cap
-    private let cushionCapFrames = 36
+    private let cushionTargetBytes = 75 << 20    // ≈24 frames at 1080p
+    private let cushionCapBytes = 113 << 20      // ≈36 frames at 1080p
+    private let cushionMinTargetFrames = 24
     #else
-    private let cushionTargetFrames = 12   // iPhone/iPad memory headroom
-    private let cushionCapFrames = 20
+    private let cushionTargetBytes = 38 << 20    // ≈12 frames at 1080p
+    private let cushionCapBytes = 63 << 20       // ≈20 frames at 1080p
+    private let cushionMinTargetFrames = 12
     #endif
+    private let cushionMaxTargetFrames = 128
+    private let cushionMaxCapFrames = 160
+    /// Data size of the most recent decoded frame (row-padding included), read
+    /// under reorderLock; 0 until the first frame sets the real scale.
+    private var cushionFrameBytes = 0
+
+    private var cushionTargetFrames: Int {
+        guard cushionFrameBytes > 0 else { return cushionMinTargetFrames }
+        return min(max(cushionTargetBytes / cushionFrameBytes, cushionMinTargetFrames), cushionMaxTargetFrames)
+    }
+
+    private var cushionCapFrames: Int {
+        guard cushionFrameBytes > 0 else { return cushionMinTargetFrames + cushionMinTargetFrames / 2 }
+        return min(max(cushionCapBytes / cushionFrameBytes, cushionMinTargetFrames + cushionMinTargetFrames / 2), cushionMaxCapFrames)
+    }
     private var feederTimer: DispatchSourceTimer?
     private let feederQueue = DispatchQueue(label: "aether.renderer.cushion-feeder", qos: .userInteractive)
 
@@ -419,6 +449,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
             CMTimeGetSeconds($0.1) > ptsSeconds
         }) ?? reorderBuffer.endIndex
         reorderBuffer.insert((pixelBuffer, pts, hdr10PlusData), at: insertIdx)
+        // Scales the byte-budgeted cushion; cheap (header read, no plane lock).
+        cushionFrameBytes = CVPixelBufferGetDataSize(pixelBuffer)
 
         // Memory bound only: within the cap, frames REST here as the decoded
         // cushion; the demand pump below (and the feeder timer) release them
