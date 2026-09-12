@@ -3557,28 +3557,41 @@ public final class AetherEngine: ObservableObject {
         // Host opt-in (per load): zap-heavy live sources with long GOPs join the software
         // path in ~0.5s where the loopback path needs 2 keyframe-aligned segments (see
         // LoadOptions.preferSoftwareVideoRoute). Honored only where CPU decode is a
-        // comfortable trade: H.264 at 1080p or below with RESOLVED dimensions — a 4K or
-        // HEVC channel on the same provider stays on the hardware-decoded native path.
-        // The software host itself can now select a VT-backed H.264 decoder, so HD live
-        // can keep fast-zap startup without paying libavcodec's steady-state 1080 cost.
-        // UNRESOLVED dims (0x0) qualify on a LIVE source: a zap-friendly probe
-        // budget routinely ends before the first H.264 IDR resolves them, the
+        // comfortable trade: H.264 or HEVC at 1080p or below — a 4K channel on the same
+        // provider stays on the hardware-decoded native path. The software host selects
+        // a VT-backed decoder for both codecs, so HD live keeps fast-zap startup without
+        // paying libavcodec's steady-state 1080 cost. HEVC additionally requires the VT
+        // probe to confirm hardware decode (mirrors the SWHost decoder pick, so the
+        // preference never trades AVPlayer HW decode for libavcodec HEVC), and DV
+        // Profile 5 stays native unconditionally (#176: IPT-PQ-c2 on the software path
+        // renders a green/purple cast; the routing fail-fast below would kill the load).
+        // UNRESOLVED dims (0x0) qualify on a LIVE source for H.264 ONLY: a zap-friendly
+        // probe budget routinely ends before the first H.264 IDR resolves them, the
         // software decoder latches dimensions from frames exactly as it does
         // for MPEG-2, and gating on resolved dims forced hosts into a long
         // re-probe (≥1.5s per join) purely to unlock this preference. A live
         // H.264 channel above 1080p is not a real broadcast shape (UHD is
-        // HEVC), so the unknown-dims case stays a comfortable CPU trade.
+        // HEVC), so the unknown-dims case stays a comfortable CPU trade —
+        // whereas an unresolved HEVC channel may well be 4K, so HEVC waits
+        // for resolved dimensions (the long-probe retry memory supplies them
+        // from the second join onward).
         if options.preferSoftwareVideoRoute, !useSoftwarePath,
-           detectedCodecID == AV_CODEC_ID_H264,
+           detectedCodecID == AV_CODEC_ID_H264 || detectedCodecID == AV_CODEC_ID_HEVC,
            let vStream = probe.stream(at: probe.videoStreamIndex),
-           let codecpar = vStream.pointee.codecpar,
-           (codecpar.pointee.height > 0 && codecpar.pointee.height <= 1080)
-               || (codecpar.pointee.height == 0 && options.isLive) {
-            useSoftwarePath = true
-            EngineLog.emit(
-                "[AetherEngine] host preference: software video route "
-                + "(h264 \(codecpar.pointee.width)x\(codecpar.pointee.height))",
-                category: .engine)
+           let codecpar = vStream.pointee.codecpar {
+            let heightQualifies = (codecpar.pointee.height > 0 && codecpar.pointee.height <= 1080)
+                || (codecpar.pointee.height == 0 && options.isLive && detectedCodecID == AV_CODEC_ID_H264)
+            let hevcQualifies = detectedCodecID != AV_CODEC_ID_HEVC
+                || (Self.dvProfile(stream: vStream) != 5
+                    && VTCapabilityProbe.canHardwareDecode(codecpar: codecpar))
+            if heightQualifies && hevcQualifies {
+                useSoftwarePath = true
+                EngineLog.emit(
+                    "[AetherEngine] host preference: software video route "
+                    + "(\(detectedCodecID == AV_CODEC_ID_HEVC ? "hevc" : "h264") "
+                    + "\(codecpar.pointee.width)x\(codecpar.pointee.height))",
+                    category: .engine)
+            }
         }
         // TEST-ONLY: forces SW path for aetherctl live --sw; unset in shipping builds.
         if Self.forceSoftwarePathForTesting {
