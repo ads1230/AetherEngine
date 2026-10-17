@@ -51,7 +51,7 @@ final class SubtitleCompositorRoundTripTests: XCTestCase {
                 let compositor = SubtitleFrameCompositor()
                 compositor.update(
                     cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("Hello"))],
-                    enabled: true)
+                    enabled: true, delaySeconds: 0)
                 let out = compositor.composite(src, ptsSeconds: 5)
                 XCTAssertTrue(out !== src, "compositor passed through; cue not composited")
                 // Sample far from the bottom-band subtitle.

@@ -1,7 +1,8 @@
+import Darwin
 import Foundation
 
 /// Sliding-window disk-backed cache for HLS-fMP4 segments. Bytes go to
-/// <NSTemporaryDirectory>/aether-segments/<uuid>/seg-N.m4s; only URLs stay in RAM.
+/// <NSTemporaryDirectory>/aether-segments/<uuid>/seg-N-G.m4s; only URLs stay in RAM.
 /// Reads use .alwaysMapped (kernel pages in/out under memory pressure). Window:
 /// [currentTargetIndex - backwardWindow, currentTargetIndex + forwardWindow].
 /// The producer pauses via awaitFetchHighWater once forwardWindow ahead of target.
@@ -9,7 +10,27 @@ import Foundation
 // across the producer/provider threads and capture in @Sendable closures.
 final class SegmentCache: @unchecked Sendable {
 
+    /// AE#412: where a stored segment's first random-access point sits, as an offset from the
+    /// segment's ADVERTISED start (its plan boundary). An offset, not an absolute time, so it is
+    /// independent of the item / source / display axes and survives an epoch that opened early.
+    ///
+    /// `<= 0` means the segment opens on a sync sample and serves any position inside it. A positive
+    /// offset means the first sync sample sits that far in, so only positions at or after it can
+    /// start a decode run. `.none` means the segment carries no sync sample at all: audio cut it on
+    /// a plan boundary the keyframe-gated cutter had folded, so nothing in it can start one.
+    enum VideoReach: Equatable, Sendable {
+        case syncAt(offsetSeconds: Double)
+        case none
+
+        /// Whether a cold arrival aiming `offsetSeconds` into this segment can be served from it.
+        func serves(offsetSeconds: Double) -> Bool {
+            guard case .syncAt(let syncOffset) = self else { return false }
+            return syncOffset <= offsetSeconds
+        }
+    }
+
     private let condition = NSCondition()
+    private let onResidentSetChanged: (@Sendable () -> Void)?
 
     private let forwardWindow: Int
     /// 20 covers Continuous-Audio handover refetches (~7-10 segments backward); smaller values
@@ -22,11 +43,28 @@ final class SegmentCache: @unchecked Sendable {
     /// and detaches AVKit's PiP legible renderer (Sodalite#32). 0 = window-only legacy pruning
     /// (live sessions, where the sliding playlist already dropped everything behind the window).
     private let retentionBudgetBytes: Int
+    private let nativeLiveDVRPolicy: LiveDVRRetentionPolicy?
+    private var nativeLiveRetentionFloor = 0
+    private lazy var nativeLiveExpiryQueue = DispatchQueue(label: "com.aetherengine.live-expiry", qos: .utility)
+    private var nativeLiveExpiryTimer: DispatchSourceTimer? // condition; opt-in, cancelled by close
 
     private var entries: [Int: URL] = [:]
     /// Per-index byte ledger for _totalBytes. Stat-on-eviction was wrong when same index was
     /// overwritten (stat returned new size, old bytes stayed counted forever).
     private var entryBytes: [Int: Int] = [:]
+
+    /// Progressive delivery: the segments a producer is writing right now, index to staging file.
+    /// Registered when the producer opens the segment (`beginInProgress`), removed when it is
+    /// adopted or abandoned. A serve that finds its index here reads the staging file as it grows
+    /// (`ProgressiveSegmentReader`) instead of waiting for the cut.
+    private var inProgress: [Int: URL] = [:]
+    /// The staging file each recently adopted segment was renamed from, and its final size, so a
+    /// progressive reader can tell that the file IT holds was sealed, rather than the same index
+    /// produced again by a later epoch. Keyed by staging file (unique per segment and epoch) and
+    /// bounded to the most recent adoptions in adoption order: evicting by index dropped every
+    /// adoption below the 64 highest at once, so after a backward seek each reader read as abandoned.
+    private var sealedFromStaging: [URL: Int] = [:]
+    private var sealedStagingOrder: [URL] = []
 
     /// Pinned in RAM (~3.5 KB); AVPlayer fetches exactly once per session; never evicted.
     private var initSegment: Data?
@@ -47,28 +85,84 @@ final class SegmentCache: @unchecked Sendable {
 
     let sessionDir: URL
 
+    /// AE#451: the `SessionDirectoryLiveness` marker held for as long as this cache lives. -1 means
+    /// unheld (open or flock failed); such a session is swept by age like before AE#451.
+    private var lockFD: Int32 = -1
+
     private var _totalBytes: Int = 0
 
     /// Monotonic across prunes; NOT decremented by pruneOutsideWindow. Lets VideoSegmentProvider
     /// detect gaps below the producer's write head after eviction erases them from indexRange().
     private var _highestStoredIndex: Int = -1
+
+    /// Audit SEG-4: every stored generation of an index gets its own file name, so a URL names exactly
+    /// one set of bytes. A reader dropping a vanished entry, or a prune deleting a doomed one after
+    /// unlocking, can then never hit a newer adoption of the same index.
+    private var fileGeneration: UInt64 = 0
+
+    private func nextSegmentFileURL(index: Int) -> URL {
+        condition.lock()
+        fileGeneration += 1
+        let generation = fileGeneration
+        condition.unlock()
+        return sessionDir.appendingPathComponent("seg-\(index)-\(generation).m4s")
+    }
     /// Plan index -> how many pumps passed it without opening a segment (#358). Survives producer
     /// restarts on purpose: the repeat across a restart is the signal.
     private var foldCounts: [Int: Int] = [:]
+    /// AE#412: what a stored segment's video is worth to a COLD arrival, per index. Absent = the
+    /// producer did not record it (live, or an unresolved time base), and callers must treat that
+    /// as "no claim" rather than as bad news.
+    private var videoReaches: [Int: VideoReach] = [:]
     /// #369: log-classification threshold: a run wider than this is a discontinuity-scale cut
     /// leap, not a long GOP. (It used to DROP such runs from the counters on the assumption they
     /// were repositions; the field case was a 2^33 wrap folding 312 indices, and dropping it left
     /// every fold counter at 0, which is exactly what disarms the #358 recovery arms.)
     static let maxFoldRunLength = 64
 
+    /// The volume holding `sessionDir` ran out of space while this session wrote to it: the
+    /// directory, a segment, or a muxer's staging file. Read when the pump gives up, so the failure
+    /// names the full disk instead of the audio or the source, neither of which is at fault.
+    /// Guarded by `condition`.
+    private var storageExhaustedLatch = false
+
+    var storageExhausted: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return storageExhaustedLatch
+    }
+
+    func noteStorageExhausted() {
+        condition.lock()
+        let first = !storageExhaustedLatch
+        storageExhaustedLatch = true
+        condition.unlock()
+        if first {
+            EngineLog.emit("[SegmentCache] the segment volume is out of space at \(sessionDir.path)",
+                           category: .session)
+        }
+    }
+
+    /// A write that failed because the volume is full: `NSFileWriteOutOfSpaceError` from Foundation,
+    /// `ENOSPC` from POSIX, or either one underneath a wrapping error.
+    static func isOutOfSpace(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteOutOfSpaceError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOSPC) { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error { return isOutOfSpace(underlying) }
+        return false
+    }
+
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
-    init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0) {
+    init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
+         baseDirectory: URL? = nil, nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
+        self.nativeLiveDVRPolicy = nativeLiveDVRPolicy
+        self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
-        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let baseDir = baseDirectory ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("aether-segments", isDirectory: true)
         let sessionID = UUID().uuidString
         self.sessionDir = baseDir.appendingPathComponent(sessionID, isDirectory: true)
@@ -79,9 +173,32 @@ final class SegmentCache: @unchecked Sendable {
         } catch {
             EngineLog.emit("[SegmentCache] session dir create failed at \(sessionDir.path): \(error)",
                            category: .session)
+            if Self.isOutOfSpace(error) { storageExhaustedLatch = true }
         }
 
+        // Before the sweep, so a sibling constructed in the same breath cannot read this session
+        // as unheld. The age check covers the remaining microseconds: a directory this young is
+        // never a sweep candidate.
+        self.lockFD = Self.acquireLiveMarker(sessionDir: sessionDir)
+
         Self.sweepStaleSessionDirs(baseDir: baseDir, currentSession: sessionID)
+    }
+
+    deinit {
+        nativeLiveExpiryTimer?.cancel()
+        releaseLiveMarker()
+    }
+
+    private static func acquireLiveMarker(sessionDir: URL) -> Int32 {
+        SessionDirectoryLiveness.acquire(sessionDir: sessionDir, logPrefix: "[SegmentCache]")
+    }
+
+    private func releaseLiveMarker() {
+        condition.lock()
+        let fd = lockFD
+        lockFD = -1
+        condition.unlock()
+        if fd >= 0 { Darwin.close(fd) }
     }
 
     private static func sweepStaleSessionDirs(baseDir: URL, currentSession: String) {
@@ -94,9 +211,14 @@ final class SegmentCache: @unchecked Sendable {
         let cutoff = Date().addingTimeInterval(-3600)
         for entry in entries where entry.lastPathComponent != currentSession {
             let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
-            if created == nil || created! < cutoff {
-                try? fm.removeItem(at: entry)
+            guard created == nil || created! < cutoff else { continue }
+            // AE#451: age says how long it has been there, not whether anyone is still using it.
+            if SessionDirectoryLiveness.isLive(entry) {
+                EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
+                               category: .session)
+                continue
             }
+            try? fm.removeItem(at: entry)
         }
     }
 
@@ -136,16 +258,65 @@ final class SegmentCache: @unchecked Sendable {
         return initVersions.first(where: { $0.versionID == versionID })?.data
     }
 
+    /// AE#451: a write into a directory that is no longer there is not a dead session. Whatever
+    /// removed it (a sibling's sweep on an older build, the OS reclaiming tmp) is outside this
+    /// class, and without this a single deletion leaves the session permanently unable to store,
+    /// so it never recovers by re-producing. Re-takes the live marker too: the old one went with
+    /// the directory, and an unmarked directory is the next sweeper's candidate.
+    private func restoreSessionDirIfMissing() -> Bool {
+        condition.lock()
+        let isClosed = closed
+        condition.unlock()
+        // A store racing close() must not resurrect the directory close() just deleted, and must
+        // not leave a held marker behind that keeps the next sweep away from it.
+        guard !isClosed else { return false }
+        guard !FileManager.default.fileExists(atPath: sessionDir.path) else { return false }
+        do {
+            try FileManager.default.createDirectory(at: sessionDir,
+                                                    withIntermediateDirectories: true,
+                                                    attributes: nil)
+        } catch {
+            EngineLog.emit("[SegmentCache] session dir restore failed at \(sessionDir.path): \(error)",
+                           category: .session)
+            if Self.isOutOfSpace(error) { noteStorageExhausted() }
+            return false
+        }
+        releaseLiveMarker()
+        let fd = Self.acquireLiveMarker(sessionDir: sessionDir)
+        condition.lock()
+        lockFD = fd
+        condition.unlock()
+        EngineLog.emit("[SegmentCache] session dir was deleted underneath a live session; restored (AE#451)",
+                       category: .session)
+        return true
+    }
+
     func store(index: Int, data: Data) {
-        let fileURL = sessionDir.appendingPathComponent("seg-\(index).m4s")
-        let writeOK: Bool
+        let fileURL = nextSegmentFileURL(index: index)
+        var writeOK: Bool
         do {
             try data.write(to: fileURL, options: [.atomic])
             writeOK = true
         } catch {
-            EngineLog.emit("[SegmentCache] write failed seg-\(index): \(error)",
-                           category: .session)
-            writeOK = false
+            // The retry's own error decides: a missing directory restored onto a full volume fails
+            // the second write with ENOSPC, behind a first error that only said the file was missing.
+            var finalError: Error? = error
+            if restoreSessionDirIfMissing() {
+                do {
+                    try data.write(to: fileURL, options: [.atomic])
+                    finalError = nil
+                } catch {
+                    finalError = error
+                }
+            }
+            if let finalError {
+                EngineLog.emit("[SegmentCache] write failed seg-\(index): \(finalError)",
+                               category: .session)
+                if Self.isOutOfSpace(finalError) { noteStorageExhausted() }
+                writeOK = false
+            } else {
+                writeOK = true
+            }
         }
 
         condition.lock()
@@ -155,76 +326,123 @@ final class SegmentCache: @unchecked Sendable {
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
+        // A re-store of a resident index changes bytes, not residency; only an insertion or an
+        // eviction moves the set, and both are already known here without walking it.
+        var residentSetChanged = false
+        var supersededFile: URL?
         if writeOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            entries[index] = fileURL
+            let superseded = entries.updateValue(fileURL, forKey: index)
+            residentSetChanged = superseded == nil
+            if let superseded { supersededFile = superseded }
             entryBytes[index] = data.count
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
         }
         let doomed = pruneOutsideWindow()
+        if !doomed.isEmpty { residentSetChanged = true }
         condition.broadcast()
         condition.unlock()
+        if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
         for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if residentSetChanged { onResidentSetChanged?() }
     }
 
     /// Adopt a staging file via rename(2). Page cache pages stay warm; skips a Swift Data round trip.
-    func adopt(index: Int, stagingPath: URL, byteCount: Int) {
-        let fileURL = sessionDir.appendingPathComponent("seg-\(index).m4s")
-        let renameOK: Bool
+    ///
+    /// `videoReach` (AE#412) is what this segment's video offers a cold arrival; nil leaves the
+    /// previous claim in place only if the index is re-adopted without one, which no caller does.
+    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) {
+        let fileURL = nextSegmentFileURL(index: index)
+        var renameOK: Bool
         do {
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                try FileManager.default.removeItem(at: fileURL)
-            }
             try FileManager.default.moveItem(at: stagingPath, to: fileURL)
             renameOK = true
         } catch {
-            EngineLog.emit("[SegmentCache] adopt failed seg-\(index): \(error)",
-                           category: .session)
-            try? FileManager.default.removeItem(at: stagingPath)
-            renameOK = false
+            if restoreSessionDirIfMissing(),
+               (try? FileManager.default.moveItem(at: stagingPath, to: fileURL)) != nil {
+                renameOK = true
+            } else {
+                EngineLog.emit("[SegmentCache] adopt failed seg-\(index): \(error)",
+                               category: .session)
+                try? FileManager.default.removeItem(at: stagingPath)
+                renameOK = false
+            }
         }
 
         condition.lock()
+        // Sealed or not, this staging file is no longer being written.
+        if inProgress[index] == stagingPath { inProgress.removeValue(forKey: index) }
+        if renameOK {
+            if sealedFromStaging.updateValue(byteCount, forKey: stagingPath) == nil {
+                sealedStagingOrder.append(stagingPath)
+            }
+            while sealedStagingOrder.count > Self.sealedStagingMemory {
+                sealedFromStaging.removeValue(forKey: sealedStagingOrder.removeFirst())
+            }
+        }
         guard !closed else {
+            condition.broadcast()
             condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
+        var residentSetChanged = false
+        var supersededFile: URL?
         if renameOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            entries[index] = fileURL
+            let superseded = entries.updateValue(fileURL, forKey: index)
+            residentSetChanged = superseded == nil
+            if let superseded { supersededFile = superseded }
             entryBytes[index] = byteCount
             _totalBytes += byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
             // A later epoch produced what an earlier one passed over: a re-anchor moved the
             // boundaries and this index is no longer a hole (#358).
             foldCounts.removeValue(forKey: index)
+            // AE#412: the claim describes THESE bytes, so a re-adoption replaces it, and an
+            // adoption that cannot state one must not leave the old epoch's claim standing.
+            videoReaches[index] = videoReach
         }
         let doomed = pruneOutsideWindow()
+        if !doomed.isEmpty { residentSetChanged = true }
         condition.broadcast()
         condition.unlock()
+        if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
         for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if residentSetChanged { onResidentSetChanged?() }
     }
 
     func close() {
         condition.lock()
         closed = true
+        let expiryTimer = nativeLiveExpiryTimer
+        nativeLiveExpiryTimer = nil
         let dir = sessionDir
+        let hadEntries = !entries.isEmpty
         entries.removeAll(keepingCapacity: false)
         entryBytes.removeAll(keepingCapacity: false)
+        videoReaches.removeAll(keepingCapacity: false)
         initSegment = nil
         initVersions.removeAll(keepingCapacity: false)
+        inProgress.removeAll(keepingCapacity: false)
+        sealedFromStaging.removeAll(keepingCapacity: false)
+        sealedStagingOrder.removeAll(keepingCapacity: false)
         _totalBytes = 0
         _highestStoredIndex = -1
         condition.broadcast()
         condition.unlock()
 
+        expiryTimer?.cancel()
+        releaseLiveMarker()
         try? FileManager.default.removeItem(at: dir)
+        // A closed cache holds nothing, and that is a resident-set change like any other. The engine
+        // clears its published band on teardown anyway; this keeps the cache honest on its own.
+        if hadEntries { onResidentSetChanged?() }
     }
 
     // MARK: - Reader side
@@ -240,6 +458,7 @@ final class SegmentCache: @unchecked Sendable {
         }
         condition.unlock()
         for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
     }
 
     /// Must be called with condition held.
@@ -260,24 +479,57 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     func peek(index: Int) -> Data? {
+        guard let url = peekURL(index: index) else { return nil }
+        return readOrDrop(index: index, url: url)
+    }
+
+    /// AE#451: the bookkeeping is not the file, and this is where the bookkeeping is redeemed.
+    ///
+    /// Every caller reads this answer as "the segment is on disk": the server streams the URL it
+    /// gets (a file that has gone answers a 404, which the #50 rule forbids for an in-range index
+    /// and AVPlayer treats as terminal on VOD), the AE#421 wedge split asks it to tell a starved
+    /// consumer from a silent one, and the byte ledger bills for it. So an entry whose file has
+    /// gone stops answering here, and the producer is free to make it again.
+    func peekURL(index: Int) -> URL? {
         condition.lock()
         let fileURL = entries[index]
         condition.unlock()
         guard let url = fileURL else { return nil }
-        return readMapped(url)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            dropVanishedEntry(index: index, url: url)
+            return nil
+        }
+        return url
     }
 
-    func peekURL(index: Int) -> URL? {
+    /// Forget an entry whose file is gone. Keeps `_highestStoredIndex`: it records how far the
+    /// producer got, which an external deletion does not undo.
+    private func dropVanishedEntry(index: Int, url: URL) {
+        condition.lock()
+        guard entries[index] == url else {
+            condition.unlock()
+            return
+        }
+        entries.removeValue(forKey: index)
+        _totalBytes -= entryBytes.removeValue(forKey: index) ?? 0
+        videoReaches.removeValue(forKey: index)
+        condition.broadcast()
+        condition.unlock()
+        EngineLog.emit("[SegmentCache] seg-\(index) vanished from disk; entry dropped (AE#451)",
+                       category: .session)
+    }
+
+    var isClosed: Bool {
         condition.lock()
         defer { condition.unlock() }
-        return entries[index]
+        return closed
     }
 
     func fetch(index: Int, timeout: TimeInterval = 15.0) -> Data? {
         condition.lock()
         if let url = entries[index] {
             condition.unlock()
-            return readMapped(url)
+            return readOrDrop(index: index, url: url)
         }
         if closed {
             condition.unlock()
@@ -290,7 +542,90 @@ final class SegmentCache: @unchecked Sendable {
         let fileURL = entries[index]
         condition.unlock()
         guard let url = fileURL else { return nil }
-        return readMapped(url)
+        return readOrDrop(index: index, url: url)
+    }
+
+    // MARK: - Progressive delivery
+
+    /// How many adoptions `sealedFromStaging` remembers: enough for every reader still draining.
+    static let sealedStagingMemory = 64
+
+    /// The producer opened segment `index` in `stagingPath`, which from here on is only appended to
+    /// until it is adopted under its final name.
+    func beginInProgress(index: Int, stagingPath: URL) {
+        condition.lock()
+        if !closed {
+            inProgress[index] = stagingPath
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+
+    /// The producer gave up the segment it was writing (restart, failed cut, teardown), so its
+    /// partial bytes are never adopted. A reader draining it learns that on its next poll.
+    func abandonInProgress(index: Int) {
+        condition.lock()
+        if inProgress.removeValue(forKey: index) != nil { condition.broadcast() }
+        condition.unlock()
+    }
+
+    enum InProgressState: Equatable {
+        case writing
+        case sealed(bytes: Int)
+        case abandoned
+    }
+
+    /// What became of the staging file a progressive reader holds.
+    func inProgressState(index: Int, stagingPath: URL) -> InProgressState {
+        condition.lock()
+        defer { condition.unlock() }
+        if inProgress[index] == stagingPath { return .writing }
+        if let bytes = sealedFromStaging[stagingPath] { return .sealed(bytes: bytes) }
+        return .abandoned
+    }
+
+    /// `fetch` for the loopback server. With `progressive`, a segment that is being written is
+    /// answered at once with a reader over its staging file, so AVPlayer receives each fragment as
+    /// the muxer flushes it instead of the whole segment after its cut.
+    func fetchSource(index: Int, timeout: TimeInterval, progressive: Bool) -> SegmentSource? {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        while true {
+            if let url = entries[index] {
+                condition.unlock()
+                return readOrDrop(index: index, url: url).map { .data($0) }
+            }
+            if closed {
+                condition.unlock()
+                return nil
+            }
+            if progressive, let staging = inProgress[index] {
+                condition.unlock()
+                if let reader = ProgressiveSegmentReader(cache: self, index: index, stagingPath: staging) {
+                    return .progressive(reader)
+                }
+                // The staging file was renamed or removed between the lookup and the open: look again.
+                condition.lock()
+                if inProgress[index] == staging { inProgress.removeValue(forKey: index) }
+                continue
+            }
+            if !condition.wait(until: deadline) {
+                condition.unlock()
+                return nil
+            }
+        }
+    }
+
+    /// AE#451: a read that comes back empty for a file the bookkeeping still lists is the same lie
+    /// `peekURL` guards against, and here it is load-bearing: this serve answers a retriable 503,
+    /// and an entry left standing means every retry takes this branch again while the producer,
+    /// which asks whether the segment is stored, is never told to make it.
+    private func readOrDrop(index: Int, url: URL) -> Data? {
+        guard let data = readMapped(url) else {
+            dropVanishedEntry(index: index, url: url)
+            return nil
+        }
+        return data
     }
 
     func fetchInit(timeout: TimeInterval = 15.0) -> Data? {
@@ -316,8 +651,9 @@ final class SegmentCache: @unchecked Sendable {
         return currentTargetIndex >= target
     }
 
-    /// Evict segments strictly below cutoff (= live firstVisible). Bounded by firstVisible <= currentTargetIndex
-    /// so it only removes segments the playlist already dropped; pruneOutsideWindow handles the forward bound.
+    /// Evict segments strictly below cutoff, which the live caller bounds at the consumer's own fetch
+    /// point (`VideoSegmentProvider.liveEvictionFloor`) so this never unlinks the segment a response is
+    /// about to stat; pruneOutsideWindow handles the forward bound.
     func evictBelow(_ cutoff: Int) {
         condition.lock()
         var doomed: [URL] = []
@@ -331,6 +667,7 @@ final class SegmentCache: @unchecked Sendable {
         for url in doomed {
             try? FileManager.default.removeItem(at: url)
         }
+        if !doomed.isEmpty { onResidentSetChanged?() }
     }
 
     /// Authoritative disk footprint via fresh stat (not _totalBytes accumulator); diagnostics path.
@@ -373,6 +710,16 @@ final class SegmentCache: @unchecked Sendable {
         return foldCounts[index] ?? 0
     }
 
+    /// AE#412: what the stored segment at `index` offers a cold arrival, or nil when nothing was
+    /// recorded for it (live, or a producer that could not resolve its time base). A caller must not
+    /// read nil as "unreachable": an unrecorded segment is exactly today's behaviour, not a defect.
+    func videoReach(_ index: Int) -> VideoReach? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard entries[index] != nil else { return nil }
+        return videoReaches[index]
+    }
+
     /// Record plan indices a cut jumped over. VOD only: a live playlist is built from what was
     /// finalized, so it never offers an index the pump skipped.
     /// #369: runs wider than `maxFoldRunLength` count too, the #358 arms exist precisely for a
@@ -393,6 +740,30 @@ final class SegmentCache: @unchecked Sendable {
         guard !entries.isEmpty else { return nil }
         let keys = entries.keys
         return (keys.min()!, keys.max()!)
+    }
+
+    /// Contiguous runs of segment indexes that are resident on disk. A 2026-09-02 field session
+    /// retained 64 segments across several islands, so min/max alone cannot describe the picture
+    /// a host can truthfully mark as loaded.
+    func residentIndexRanges() -> [ClosedRange<Int>] {
+        condition.lock()
+        defer { condition.unlock() }
+        let indexes = entries.keys.sorted()
+        guard let first = indexes.first else { return [] }
+        var ranges: [ClosedRange<Int>] = []
+        var lower = first
+        var upper = first
+        for index in indexes.dropFirst() {
+            if index == upper + 1 {
+                upper = index
+            } else {
+                ranges.append(lower...upper)
+                lower = index
+                upper = index
+            }
+        }
+        ranges.append(lower...upper)
+        return ranges
     }
 
     /// Monotonic across prunes; reset per restart via resetHighWaterForRestart().
@@ -455,6 +826,29 @@ final class SegmentCache: @unchecked Sendable {
         return k - 1
     }
 
+    /// AE#441: the mirror of `contiguousForwardFrontier`, walking DOWN. Smallest K such that every index
+    /// in `K ... topIdx` is resident, or `topIdx + 1` when `topIdx` itself is absent (nothing to walk).
+    ///
+    /// This, not `indexRange().0`, is the honest floor of a rewind: `min ... max` is not proof of
+    /// residency, because retained scrub bands leave interior holes (the same reason the segment-serve
+    /// path refuses to treat that range as coverage). A floor advertised below a hole promises a rewind
+    /// that cannot then play forward.
+    func contiguousBackwardFloor(from topIdx: Int) -> Int {
+        condition.lock()
+        defer { condition.unlock() }
+        var k = topIdx
+        while entries[k] != nil { k -= 1 }
+        return k + 1
+    }
+
+    /// AE#441: the newest resident index, which is where a backward floor walk starts. `highestStoredIndex`
+    /// is monotonic across prunes and would start the walk on a hole after the high end is pruned.
+    var highestResidentIndex: Int? {
+        condition.lock()
+        defer { condition.unlock() }
+        return entries.keys.max()
+    }
+
     /// Reset before triggering a restart; previous producer's highWater would keep producerPassedAndPruned
     /// hot on every fetch, cascading a single restart into a per-segment storm.
     func resetHighWaterForRestart() {
@@ -474,6 +868,16 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return _totalBytes
+    }
+
+    /// AE#443: mean on-disk size of a resident segment, which is what turns a window in seconds into a
+    /// window in bytes (`LiveWindowSizing.affordableSegments`). nil while nothing is resident, so an
+    /// empty cache states that it cannot answer rather than answering zero.
+    var meanEntryBytes: Int? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !entries.isEmpty, _totalBytes > 0 else { return nil }
+        return Int(_totalBytes) / entries.count
     }
 
     /// On-disk bytes at or above the consumer's current target: what the producer's race-ahead owns
@@ -511,6 +915,63 @@ final class SegmentCache: @unchecked Sendable {
         return bytes
     }
 
+    /// Metadata-only admission from the host setter. Exactly one weakly-owned timer per opted-in
+    /// cache; it progresses even when the pump is parked and AVPlayer makes no playlist requests.
+    func startNativeLiveDVRExpiryChecks() {
+        condition.lock()
+        guard !closed, nativeLiveDVRPolicy != nil, nativeLiveExpiryTimer == nil else {
+            condition.unlock()
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(queue: nativeLiveExpiryQueue)
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in _ = self?.reconcileExpiredNativeLiveDVRRetention() }
+        nativeLiveExpiryTimer = timer
+        timer.resume()
+        condition.unlock()
+    }
+
+    /// Both the independent timer and the producer use this implementation. The cap is evaluated
+    /// by the caller FIRST; then expiry pruning and the current entry count share this lock hold.
+    /// An expired smaller cap cannot park a pump behind unpruned expanded history.
+    @discardableResult
+    func reconcileExpiredNativeLiveDVRRetention(headroomCap: Int? = nil) -> Bool {
+        condition.lock()
+        guard !closed else { condition.unlock(); return false }
+        let expiredOrDenied = nativeLiveDVRPolicy?.snapshot?.retentionBytes == 0
+        let doomed = expiredOrDenied ? pruneOutsideWindow() : []
+        let hasHeadroom = headroomCap.map { entries.count < $0 } ?? true
+        if !doomed.isEmpty { condition.broadcast() }
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
+        return hasHeadroom
+    }
+
+    /// Called off the main actor after a native limit update and each finalized live segment.
+    func applyNativeLiveRetentionFloor(_ floor: Int) {
+        condition.lock()
+        nativeLiveRetentionFloor = max(nativeLiveRetentionFloor, floor)
+        let doomed = pruneOutsideWindow()
+        condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
+    }
+
+    /// The finite exception consists of the consumer's existing handover/prefetch band and
+    /// eight newest segments. No unbounded `[target ... highestStoredIndex]` exception for live.
+    private func isNativeLiveMandatory(_ index: Int) -> Bool {
+        let consumer = currentTargetIndex >= 0 &&
+            index >= currentTargetIndex - backwardWindow && index <= currentTargetIndex + forwardWindow
+        return consumer || index > _highestStoredIndex - LiveWindowSizing.minSafeSegments
+    }
+
+    var nativeLiveMandatoryBytes: Int {
+        condition.lock(); defer { condition.unlock() }
+        return entryBytes.reduce(0) { $0 + (isNativeLiveMandatory($1.key) ? $1.value : 0) }
+    }
+
     // MARK: - Internal
 
     /// Prune to [currentTarget - backwardWindow, max(currentTarget + forwardWindow, highestStoredIndex)].
@@ -524,6 +985,24 @@ final class SegmentCache: @unchecked Sendable {
     /// ends keeps each side of the resident span contiguous, so the provider's residency gate
     /// (a resident backward target = no producer restart) holds across the whole retained span.
     private func pruneOutsideWindow() -> [URL] {
+        if let limits = nativeLiveDVRPolicy?.snapshot {
+            var keptBytes = entryBytes.reduce(0) { $0 + (isNativeLiveMandatory($1.key) ? $1.value : 0) }
+            var doomed: [URL] = []
+            // Newest-first produces a contiguous playable suffix, even when an older consumer
+            // band must remain pinned. The published DVR range already walks this suffix.
+            for index in entries.keys.sorted(by: >) where !isNativeLiveMandatory(index) {
+                let bytes = entryBytes[index] ?? 0
+                if index >= nativeLiveRetentionFloor && bytes <= max(0, limits.retentionBytes - keptBytes) {
+                    keptBytes += bytes
+                } else if let url = entries.removeValue(forKey: index) {
+                    _totalBytes -= bytes
+                    entryBytes.removeValue(forKey: index)
+                    videoReaches.removeValue(forKey: index)
+                    doomed.append(url)
+                }
+            }
+            return doomed
+        }
         let lo = currentTargetIndex - backwardWindow
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
         var doomed: [URL] = []
@@ -547,6 +1026,7 @@ final class SegmentCache: @unchecked Sendable {
                     _totalBytes -= bytes
                     entryBytes.removeValue(forKey: k)
                     entries.removeValue(forKey: k)
+                    videoReaches.removeValue(forKey: k)
                     doomed.append(url)
                 }
             }
@@ -557,6 +1037,7 @@ final class SegmentCache: @unchecked Sendable {
                 _totalBytes -= entryBytes[k] ?? byteSize(of: url)
                 entryBytes.removeValue(forKey: k)
                 entries.removeValue(forKey: k)
+                videoReaches.removeValue(forKey: k)
                 doomed.append(url)
             }
         }
@@ -590,5 +1071,92 @@ final class SegmentCache: @unchecked Sendable {
     private func byteSize(of url: URL) -> Int {
         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
         return values?.fileSize ?? 0
+    }
+}
+
+/// A segment as the loopback server gets it: complete bytes, or a reader over one being written.
+enum SegmentSource {
+    case data(Data)
+    case progressive(ProgressiveSegmentReader)
+}
+
+/// Reads a segment while its producer is still writing it.
+///
+/// The muxer appends each flushed fragment (moof+mdat) to the staging file and never rewrites what
+/// it wrote, and adoption renames the file as it stands. So a descriptor opened on the staging file
+/// reads a growing prefix of the final segment, the rename does not disturb it, and the read is
+/// complete at the byte count the cache records for the adoption. A segment the producer abandons
+/// reads as `.abandoned`, and the server closes the connection so AVPlayer asks for it again.
+final class ProgressiveSegmentReader: @unchecked Sendable {
+    let index: Int
+    let stagingPath: URL
+    private let fd: Int32
+    private weak var cache: SegmentCache?
+    private(set) var offset: Int64 = 0
+
+    enum Next: Equatable {
+        case bytes(Data)
+        case finished
+        case abandoned
+    }
+
+    init?(cache: SegmentCache, index: Int, stagingPath: URL) {
+        let fd = open(stagingPath.path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        self.fd = fd
+        self.cache = cache
+        self.index = index
+        self.stagingPath = stagingPath
+    }
+
+    deinit { close(fd) }
+
+    /// The next bytes past `offset`, waiting for the producer to write them. `.finished` once the
+    /// sealed segment is read to its end; `.abandoned` when the producer gave it up, or wrote nothing
+    /// for `idleTimeout` (a wedged producer must not hold a connection forever).
+    func next(maxBytes: Int = 256 * 1024, pollInterval: TimeInterval = 0.02,
+              idleTimeout: TimeInterval = 60) -> Next {
+        let deadline = Date().addingTimeInterval(idleTimeout)
+        while true {
+            var st = stat()
+            let statOK = fstat(fd, &st) == 0
+            if statOK, st.st_size > offset {
+                let count = Int(min(Int64(maxBytes), st.st_size - offset))
+                var data = Data(count: count)
+                let read = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
+                if read > 0 {
+                    if read < count { data.removeSubrange(read ..< count) }
+                    offset += Int64(read)
+                    return .bytes(data)
+                }
+            }
+            switch cache?.inProgressState(index: index, stagingPath: stagingPath) ?? .abandoned {
+            case .writing:
+                break
+            case .sealed(let bytes):
+                if offset >= Int64(bytes) { return .finished }
+                // The last fragment can land with the seal, after the stat above, so stat again and
+                // read on. A file shorter than its recorded size is not a state to spin in.
+                var sealedStat = stat()
+                if fstat(fd, &sealedStat) == 0, sealedStat.st_size > offset { continue }
+                return .abandoned
+            case .abandoned:
+                return .abandoned
+            }
+            if Date() >= deadline { return .abandoned }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+    }
+
+    /// Reads to the seal, for a caller that needs the whole segment. nil when it was abandoned.
+    func readToEnd() -> Data? {
+        var all = Data()
+        while true {
+            switch next() {
+            case .bytes(let d): all.append(d)
+            case .finished: return all
+            case .abandoned: return nil
+            }
+        }
     }
 }

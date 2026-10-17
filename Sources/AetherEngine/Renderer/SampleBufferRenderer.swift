@@ -5,40 +5,247 @@ import CoreVideo
 
 /// Video renderer using AVSampleBufferDisplayLayer for optimal frame pacing.
 ///
-/// Includes a small reorder buffer (4 frames) to handle B-frame decode
-/// order from VTDecompressionSession. Frames are sorted by PTS before
-/// being enqueued to the display layer in strict presentation order.
-/// Which display-layer flush operation a flush request maps to. Split out of SampleBufferRenderer.flush()
-/// as a pure value so the seek-holds-frame contract (issue #90) is testable without a live
-/// AVSampleBufferDisplayLayer.
-enum DisplayFlushOp: Equatable {
-    /// tvOS 18+/iOS 18+/macOS 15+: AVSampleBufferVideoRenderer.flush(removingDisplayedImage:).
-    case rendererFlush(removingDisplayedImage: Bool)
-    /// Legacy AVSampleBufferDisplayLayer.flushAndRemoveImage(), clears the visible frame.
-    case removeImage
-    /// Legacy AVSampleBufferDisplayLayer.flush(), keeps the last frame on screen (hold through seek).
-    case holdImage
-
-    static func resolve(removingDisplayedImage: Bool, modernRenderer: Bool) -> DisplayFlushOp {
-        if modernRenderer {
-            return .rendererFlush(removingDisplayedImage: removingDisplayedImage)
-        }
-        return removingDisplayedImage ? .removeImage : .holdImage
-    }
-}
-
+/// Includes a small reorder buffer to handle B-frame decode order from VTDecompressionSession
+/// (4 frames, see `reorderDepth(forHardwareDecoder:)`). Frames are sorted by PTS before
+/// being enqueued to the display layer in strict presentation order. The FEL path skips it and
+/// hands frames over in decode order with a floor on upcoming timestamps instead
+/// (`setArrivalOrderHandover(frameRate:)`).
 final class SampleBufferRenderer: @unchecked Sendable {
 
-    private(set) var displayLayer: AVSampleBufferDisplayLayer
+    let displayLayer: AVSampleBufferDisplayLayer
+
+    /// The layer's queue surface, taken once on the main actor at construction (#351). The 27 SDKs
+    /// isolate `AVSampleBufferDisplayLayer` to the main actor, `AVSampleBufferVideoRenderer` is not, so
+    /// the decode thread enqueues, flushes and reads status through this and never touches the layer.
+    /// A stored reference cannot drift from the layer: neither is ever replaced, HDR output flips
+    /// `preferredDynamicRange` on the same layer.
+    ///
+    /// tvOS 26+ fails the deprecated layer enqueue/flush/isReadyForMoreMediaData under an
+    /// AVSampleBufferRenderSynchronizer with FigVideoQueueRemote -12080 after the first enqueue, so
+    /// this renderer is the only queue target, and the one the synchronizer is given.
+    let videoRenderer: AVSampleBufferVideoRenderer
 
     /// SW-PiP Phase C: composites active subtitle cues into frames while PiP is active (the system
     /// window renders only this layer, the host overlay cannot reach it).
     let subtitleCompositor = SubtitleFrameCompositor()
 
-    /// B-frame reorder buffer (4 frames): collects decoder output, flushes to display layer in ascending PTS order. Third tuple slot carries per-frame HDR10+ T.35 SEI bytes, paired through the reorder to kCMSampleAttachmentKey_HDR10PlusPerFrameData.
+    /// B-frame reorder buffer: collects decoder output, flushes to display layer in ascending PTS order. Third tuple slot carries per-frame HDR10+ T.35 SEI bytes, paired through the reorder to kCMSampleAttachmentKey_HDR10PlusPerFrameData.
     private let reorderLock = NSLock()
     private var reorderBuffer: [(CVPixelBuffer, CMTime, Data?)] = []
-    private let reorderDepth = 4  // handles up to 3 consecutive B-frames
+
+    /// Audit PERF-104: VideoToolbox HEVC with temporal processing emits B-frames out of presentation
+    /// order (19479fc5, -12080 from the layer), so its renderer holds 4 frames, enough for 3
+    /// consecutive B-frames. libavcodec and dav1d emit presentation order, and 3 held frames are 75 MB
+    /// of IOSurface at 4K P010 for nothing. One frame stays held either way: #407 reads each frame's
+    /// duration off its held successor.
+    static let hardwareDecoderReorderDepth = 4
+    static let presentationOrderReorderDepth = 1
+    static func reorderDepth(forHardwareDecoder hardware: Bool) -> Int {
+        hardware ? hardwareDecoderReorderDepth : presentationOrderReorderDepth
+    }
+
+    /// Guarded by `reorderLock`. Starts at the hardware depth, so a renderer nobody configured keeps the
+    /// behaviour it always had.
+    private var reorderDepth = SampleBufferRenderer.hardwareDecoderReorderDepth
+
+    /// Set once by the host when it picks the decoder; a depth below the current one takes effect on
+    /// the next enqueue, which hands the surplus over in order.
+    func setReorderDepth(_ depth: Int) {
+        reorderLock.lock()
+        reorderDepth = max(1, min(depth, Self.hardwareDecoderReorderDepth))
+        reorderLock.unlock()
+    }
+
+    /// Arrival-order handover: frames go to the renderer the moment they arrive, in decode order,
+    /// and `presentationTimeExpectation = .minimumUpcoming(_:)` tells it the lowest timestamp still to
+    /// come (`PresentationFloor`), so the renderer sorts by presentation time itself. The reorder
+    /// buffer is bypassed. Used on the FEL path, where the held frames came out of the look-ahead
+    /// budget: with 4 held inside a 9-frame window the layer dropped about 1 frame in 5 on the Apple
+    /// TV (A12), and handing them over instead took that to the 4 to 6 a run drops with the compose
+    /// skipped altogether, at no extra memory (2026-10-13, three interleaved rounds each).
+    /// Guarded by `reorderLock`; nil uses the reorder buffer.
+    private var arrivalFloor: PresentationFloor?
+
+    /// The seek threshold on the arrival-order path, which outlives the first frame past it:
+    /// `skipUntilPTS` is cleared by that frame, but in decode order it is the GOP's next anchor, and
+    /// B-frames below the target still follow it. Cleared by `flush`. Guarded by `reorderLock`.
+    private var arrivalSkipBelow: Double?
+
+    /// Frames that arrived below a floor the renderer had already been promised. Still handed over
+    /// (the renderer may drop them), counted so a stream that breaks the promise is visible.
+    /// Guarded by `reorderLock`.
+    private var _framesBelowFloor = 0
+    var framesBelowFloor: Int {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _framesBelowFloor
+    }
+
+    /// Switches arrival-order handover on for a stream of `frameRate` frames per second, or off with
+    /// nil. Stays off without a usable rate, since the floor walks the frame grid and a wrong grid
+    /// would promise past frames still to come, and on visionOS 1.0, which has no expectation API.
+    func setArrivalOrderHandover(frameRate: Double?) {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        if #available(visionOS 1.1, *), let rate = frameRate, Self.arrivalOrderFrameRates.contains(rate) {
+            arrivalFloor = PresentationFloor(interval: 1 / rate)
+        } else {
+            arrivalFloor = nil
+        }
+    }
+
+    /// Rates the floor trusts. A declared rate below the real one would promise past B-frames still to
+    /// come, and a bogus `avg_frame_rate` in the thousands would walk the grid a slot at a time.
+    static let arrivalOrderFrameRates: ClosedRange<Double> = 10...120
+
+    var handsOverInArrivalOrder: Bool {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return arrivalFloor != nil
+    }
+
+    /// Frames waiting for a smaller presentation time. Diagnostics and tests.
+    var heldFrameCount: Int {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return reorderBuffer.count
+    }
+
+    /// How many frame intervals of compressed video may be admitted ahead of the playback clock on
+    /// the FEL path. The gate runs BEFORE decode, so the decode + EL + compose latency (a few frames)
+    /// comes out of this budget: 5 left a displayed lead of ~0 and the layer dropped 9 frames/s
+    /// on device, against 0.5 s and no drops with no cap. A composed 4K frame costs ~25 MB, and
+    /// Apple's readiness gate alone allowed ~12 of them. The FEL path hands frames over in arrival
+    /// order (`setArrivalOrderHandover`), so none of the window sits in our reorder buffer: with
+    /// `hardwareDecoderReorderDepth` frames held there instead, the display layer was 4 frames short
+    /// of this budget and dropped about 1 frame in 5 on the Apple TV.
+    static let felVideoLookaheadFrames = 9
+    private var felFrameRate: Double?  // guarded by reorderLock; nil leaves non-FEL pacing unchanged
+    /// Highest compressed-packet PTS the gate has seen, and the largest amount any later packet's PTS
+    /// fell below it. Packets arrive in decode order, so with B-frames a packet's PTS runs ahead of the
+    /// frames still waiting to be displayed; measured on the real fixtures that lead is up to 7 frames
+    /// (a hierarchical-B GOP of 8), 2 to 4 on other clips, 0 on a third. The gate subtracts it so the cap bounds
+    /// display-order look-ahead rather than swinging with the position in the GOP. Guarded by
+    /// `reorderLock`; reset on flush.
+    private var gateMaxPacketPTS: Double?
+    private var gateReorderLead: Double = 0
+    /// HEVC's ceiling on `sps_max_num_reorder_pics`; a bigger PTS gap than this many frames is not reordering.
+    static let maxReorderPictures: Double = 16
+    /// Ceiling on the learned reorder lead, in frames. A hierarchical-B GOP of 8 makes a packet trail the
+    /// highest PTS seen by up to 7 frames in decode order (measured on a UHD Blu-ray FEL remux; other
+    /// clips measured 2 to 4); 8 leaves one frame to spare. It is unrelated to `hardwareDecoderReorderDepth`,
+    /// which sizes the buffer behind the decoder. Without a ceiling one backward timestamp glitch inside
+    /// the 16-picture window would raise the lead, and so the admitted look-ahead, for the whole session.
+    static let maxLearnedReorderFrames: Double = 8
+
+    /// Display-order PTS estimate for a packet in decode order. Pure; the state is passed in.
+    ///
+    /// A gap below the highest PTS seen that is larger than `maxLead` cannot be B-frame reordering
+    /// (HEVC allows at most 16 pictures of it), so it is a timestamp discontinuity: the highest PTS
+    /// restarts from this packet and the learned lead is left alone, instead of absorbing the jump
+    /// into the lead and switching the look-ahead cap off for the rest of the session.
+    ///
+    /// The learned lead is also capped at `maxLearnedLead`: a backward step inside the 16-picture
+    /// window that is still a glitch (a 12-frame one, say) would otherwise raise the lead for the whole
+    /// session, and with it the look-ahead the gate admits. The gate passes `maxLearnedReorderFrames`.
+    static func displayOrderPTS(packetPTS: Double, maxSeenPTS: Double?, reorderLead: Double,
+                                maxLead: Double = .infinity, maxLearnedLead: Double = .infinity)
+        -> (pts: Double, maxSeen: Double, lead: Double) {
+        let seen = maxSeenPTS ?? packetPTS
+        if seen - packetPTS > maxLead {
+            return (packetPTS - reorderLead, packetPTS, reorderLead)
+        }
+        let maxSeen = max(seen, packetPTS)
+        let lead = min(maxLearnedLead, max(reorderLead, maxSeen - packetPTS))
+        return (packetPTS - lead, maxSeen, lead)
+    }
+
+    func setFELLookahead(enabled: Bool, frameRate: Double?) {
+        reorderLock.lock()
+        // Container avg_frame_rate -> r_frame_rate; use 24 fps if both are unavailable.
+        felFrameRate = enabled ? (frameRate.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 24) : nil
+        // Whatever was learned belonged to the previous stream or setting.
+        gateMaxPacketPTS = nil
+        gateReorderLead = 0
+        reorderLock.unlock()
+    }
+
+    /// How much composed video the FEL path hands the layer before the clock starts, in seconds
+    /// (`prerollSatisfied(clock:live:)`): four frames at 24 fps, which covers a decode-order burst of a
+    /// hierarchical GOP. Measured on the Apple TV 4K (A12) with 4K FEL, the preroll completes after
+    /// 90 to 100 ms at a start and 0.3 to 0.9 s after a seek.
+    static let felPrerollSeconds = 0.167
+
+    /// `felPrerollSeconds`, capped one frame inside the look-ahead window: with the clock held still,
+    /// `mayEnqueueAnotherFrame` admits nothing past `felVideoLookaheadFrames` frames ahead of it, so
+    /// at 60 fps (nine frames, 0.15 s) a 0.167 s preroll could never fill and every start waited out
+    /// `AudioOutput.prerollTimeout`.
+    static func felPrerollSeconds(frameRate: Double) -> Double {
+        min(felPrerollSeconds, Double(felVideoLookaheadFrames - 1) / frameRate)
+    }
+
+    /// How much video every other software route hands the layer before the clock starts, in seconds
+    /// past it (`prerollSatisfied(clock:live:)`): the frame at the clock and three after it at 24 fps.
+    /// Without it a start or a seek ran the clock while the decoder was still working from the keyframe
+    /// up to the target, and the first frames arrived late: 0.9 s and 5 to 7 dropped frames on a 4K
+    /// HEVC title with no audio after a 10 s GOP on an Apple TV 4K (A15), 0.3 s and 3 on 1080p H.264
+    /// with audio (#800).
+    static let videoPrerollSeconds = 0.125
+
+    /// The preroll gate for `AudioOutput.videoPrerollSatisfied`: true once frames up to the preroll
+    /// past `clock` (source seconds) are in the layer, `felPrerollSeconds` on the FEL path and
+    /// `videoPrerollSeconds` on every other one. nil for a clock with no position, and off the FEL
+    /// path on a live stream, whose join starts the clock from the first audio and lets the picture
+    /// follow. On the arrival-order path only the frontier counts, the newest timestamp with every
+    /// earlier slot handed over, so a frame that came early past a gap does not open the gate.
+    func prerollSatisfied(clock: Double, live: Bool) -> Bool? {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        guard clock.isFinite else { return nil }
+        let rate = felFrameRate
+        if rate == nil, live { return nil }
+        let handed = arrivalFloor != nil ? arrivalFloor?.frontier : _lastReleasedPtsSeconds
+        guard let handed else { return false }
+        guard let rate else { return handed - clock >= Self.videoPrerollSeconds }
+        return handed + 1 / rate - clock >= Self.felPrerollSeconds(frameRate: rate)
+    }
+
+    /// Combined queue-readiness and look-ahead gate, called BEFORE decode so excess frames stay compressed.
+    func mayEnqueueVideoFrame(ptsSeconds: Double, clockSeconds: Double, clockArmed: Bool) -> Bool {
+        reorderLock.lock()
+        let rate = felFrameRate
+        let frontier = _newestEnqueuedPtsSeconds
+        var gatePTS = ptsSeconds.isFinite ? ptsSeconds : frontier ?? .nan
+        if rate != nil, ptsSeconds.isFinite {
+            let d = Self.displayOrderPTS(packetPTS: ptsSeconds, maxSeenPTS: gateMaxPacketPTS,
+                                         reorderLead: gateReorderLead,
+                                         maxLead: Self.maxReorderPictures / (rate ?? 24),
+                                         maxLearnedLead: Self.maxLearnedReorderFrames / (rate ?? 24))
+            gateMaxPacketPTS = d.maxSeen
+            gateReorderLead = d.lead
+            gatePTS = d.pts
+        }
+        reorderLock.unlock()
+        // Fork: the decoded-frame cushion (`wantsMoreDecodedFrames`) is the back-pressure signal, not
+        // the layer's momentary readiness — the cushion can never fill past the layer's own tiny queue
+        // otherwise (see the cushion notes above).
+        return Self.mayEnqueueAnotherFrame(
+            rendererReady: wantsMoreDecodedFrames, felFrameRate: rate,
+            framePTS: gatePTS,
+            clockSeconds: clockSeconds, clockArmed: clockArmed)
+    }
+
+    /// Pure admission decision. Before clock arming there is no meaningful lead: preserve startup
+    /// and the existing broken-audio arming fallback. Late frames remain eligible for catch-up.
+    static func mayEnqueueAnotherFrame(
+        rendererReady: Bool, felFrameRate: Double?, framePTS: Double,
+        clockSeconds: Double, clockArmed: Bool
+    ) -> Bool {
+        guard rendererReady else { return false }
+        guard let rate = felFrameRate, rate.isFinite, rate > 0,
+              clockArmed, clockSeconds.isFinite, framePTS.isFinite else { return true }
+        return framePTS - clockSeconds <= Double(felVideoLookaheadFrames) / rate
+    }
 
     // MARK: - Decoded-frame cushion (VLC-style)
     //
@@ -117,7 +324,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         while true {
             let now = CFAbsoluteTimeGetCurrent()
             reorderLock.lock()
-            guard reorderBuffer.count > reorderDepth, queueTarget.isReadyForMoreMediaData else {
+            guard reorderBuffer.count > reorderDepth, queueTargetReady else {
                 reorderLock.unlock()
                 return
             }
@@ -132,8 +339,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 lastHandoffRelease = now
             }
             let (pb, t, hdr) = reorderBuffer.removeFirst()
+            // Upstream's hand-over frontier (the out-of-order guard, the preroll gate and the #407
+            // exact-duration successor) moves on every release path, this pump included.
+            _lastReleasedPtsSeconds = CMTimeGetSeconds(t)
+            let next = reorderBuffer.first?.1
             reorderLock.unlock()
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
         }
     }
 
@@ -207,6 +418,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// AE#395: the session's renderer axis, shared with the `AudioOutput` whose synchronizer this
+    /// renderer runs on. Only the stamp on the sample buffer moves onto it; the reorder buffer, the
+    /// frontier and the frame-time reports stay on the source axis. Guarded by `reorderLock`.
+    private var _timeline: RendererTimeline?
+
+    func setTimeline(_ timeline: RendererTimeline?) {
+        reorderLock.lock()
+        _timeline = timeline
+        reorderLock.unlock()
+    }
+
     /// #311: moved on by every flush, so a consumer can drop the frame times it recorded for frames the
     /// compositor has since discarded. Guarded by `reorderLock`.
     ///
@@ -242,8 +464,42 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private var loggedLayerFailed = false
     private var loggedNotReady = false
     /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
+    /// Guarded by `reorderLock` since #407: the 1 Hz diagnostic reads it off the main actor while the
+    /// decode thread writes it, and the two counts it is compared against are read under the same lock.
     private(set) var enqueueCount = 0
     private var hdr10PlusAttachedCount = 0
+
+    /// #407: frames that reached `flushFrame` and still never got to the layer, because the sample
+    /// buffer could not be built. Separate from `_untimedFramesDropped` (refused before the reorder
+    /// buffer) and from the post-seek skip, which is a decision rather than a loss. Guarded by
+    /// `reorderLock`.
+    private var _sampleBuildFailures = 0
+
+    /// #407: spacing of the timestamps actually handed to the layer, over the interval since the last
+    /// snapshot. `framesEnqueued` counts DECODER OUTPUT, so a per-second frame count reads healthy for
+    /// an even 24 fps timeline and for one carrying a doubled or a duplicate interval alike; only the
+    /// spacing separates them. Guarded by `reorderLock`, reset by `takeCadence()`.
+    private var _lastHandedPtsSeconds: Double?
+    /// Audit PERF-104: the newest timestamp that LEFT the reorder buffer, recorded under the same lock
+    /// that pops it. The late-frame guard reads this, not `_lastHandedPtsSeconds`, which is written
+    /// after the layer enqueue: a second enqueuer (a drain beside the decode thread) landing in that
+    /// gap would be judged against the frame before and slip through out of order. Reset by `flush`.
+    /// Guarded by `reorderLock`.
+    private var _lastReleasedPtsSeconds: Double?
+    private var _minHandedDeltaSeconds = Double.infinity
+    private var _maxHandedDeltaSeconds = -Double.infinity
+
+    /// Audit PERF-104: frames that arrived after a later one had already been handed over, so they can
+    /// no longer be enqueued in presentation order. Dropped rather than enqueued out of order, and the
+    /// first one raises the depth to the hardware decoder's for the rest of this renderer's life, which
+    /// covers an HEVC stream whose SPS understates its reorder and PTS derived by the demuxer.
+    /// Guarded by `reorderLock`.
+    private var _outOfOrderFramesDropped = 0
+    var outOfOrderFramesDropped: Int {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _outOfOrderFramesDropped
+    }
 
     /// #298: frames refused at the enqueue gate for carrying an unschedulable PTS. Guarded by `reorderLock`.
     private var _untimedFramesDropped = 0
@@ -292,8 +548,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
         if let settled { observer?(settled) }
     }
 
-    init() {
-        displayLayer = Self.makeDisplayLayer(isHDR: false)
+    /// #489: the gravity is a construction parameter, not something a caller assigns afterwards.
+    /// The engine holds the host app's picture mode across loads, and a layer that starts on the
+    /// default and is corrected a moment later shows one frame of the wrong fill.
+    ///
+    /// Main-actor isolated because the layer is (#351); the only production caller,
+    /// `SoftwarePlaybackHost`, already is.
+    @MainActor
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        let layer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
+        displayLayer = layer
+        videoRenderer = layer.sampleBufferRenderer
     }
 
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own
@@ -306,24 +571,51 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let accumulatedDelay: TimeInterval
     }
 
-    /// nil where the metrics cannot be asked for: an OS predating the API, or the pre-tvOS-18 path
-    /// where the queue target is the display layer itself rather than an `AVSampleBufferVideoRenderer`.
+    /// #407: what the renderer itself put on the layer, as opposed to what the decoder produced.
+    /// `RenderMetrics` describes the layer's verdict on frames it received; this describes the frames
+    /// it received, which is the half no counter covered while a report of visible judder read clean
+    /// on every one of them.
+    struct Cadence: Sendable {
+        /// Cumulative frames handed to the queue target.
+        let handedOver: Int
+        /// Cumulative frames lost between the decoder callback and the layer: unschedulable
+        /// timestamps plus failed sample-buffer builds. A gap between the decoder's count and
+        /// `handedOver` that this does not account for is a post-seek skip.
+        let lostBeforeLayer: Int
+        /// Shortest and longest gap between consecutive handed-over timestamps over the interval,
+        /// nil when fewer than two frames were handed over. Source axis, seconds.
+        let minDeltaSeconds: Double?
+        let maxDeltaSeconds: Double?
+    }
+
+    /// Reads the cadence counters and resets the per-interval spacing extremes. Called at 1 Hz by the
+    /// diagnostic line; the cumulative counts survive, the min/max describe the interval only.
+    func takeCadence() -> Cadence {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        let minD = _minHandedDeltaSeconds.isFinite ? _minHandedDeltaSeconds : nil
+        let maxD = _maxHandedDeltaSeconds.isFinite ? _maxHandedDeltaSeconds : nil
+        _minHandedDeltaSeconds = .infinity
+        _maxHandedDeltaSeconds = -.infinity
+        return Cadence(handedOver: enqueueCount,
+                       lostBeforeLayer: _untimedFramesDropped + _sampleBuildFailures + _outOfOrderFramesDropped,
+                       minDeltaSeconds: minD, maxDeltaSeconds: maxD)
+    }
+
+    /// nil only on visionOS 1.0: the metrics accessor arrived in tvOS/iOS 17.4, macOS 14.4 and visionOS
+    /// 1.1, and visionOS is the one platform whose package floor still sits below it.
     ///
-    /// #313: main-actor isolated, and reading through the completion-handler accessor rather than
-    /// the async one, because the two halves of that constraint come from different toolchains and
-    /// no single `await` on `videoPerformanceMetrics` satisfies both. An SDK that isolates the layer
-    /// to the main actor refuses to hand `sampleBufferRenderer` to any other domain; a toolchain
-    /// that imports the async accessor as `nonisolated` refuses to take that non-Sendable renderer
-    /// from the main actor. The completion form suspends without moving the renderer anywhere, so it
-    /// holds on both. Every caller is main-actor isolated already, so the annotation costs no hop.
+    /// #313: reads through the completion-handler accessor rather than the async one. A toolchain that
+    /// imports the async accessor as `nonisolated` refuses to take the non-Sendable renderer across an
+    /// actor boundary, and the completion form suspends without moving the renderer anywhere. Main-actor
+    /// isolated because every caller is, so the annotation costs no hop.
     ///
-    /// #344: the version list gates the metrics accessor (tvOS/iOS 17.4, macOS 14.4, visionOS 1.1),
-    /// not the renderer, which exists from visionOS 1.0. tvOS/iOS 18 and macOS 15 stay as they are:
-    /// below them `queueTarget` is the display layer, so there is no renderer to ask.
+    /// #344: visionOS has to be named. Falling through to `*` resolves it to the declared floor (1.0),
+    /// which is a compile error rather than a runtime nil.
     @MainActor
     func loadRenderMetrics() async -> RenderMetrics? {
-        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, visionOS 1.1, *) else { return nil }
-        let renderer = displayLayer.sampleBufferRenderer
+        guard #available(visionOS 1.1, *) else { return nil }
+        let renderer = videoRenderer
         return await withCheckedContinuation { (cont: CheckedContinuation<RenderMetrics?, Never>) in
             renderer.loadVideoPerformanceMetrics { m in
                 guard let m else { return cont.resume(returning: nil) }
@@ -337,33 +629,34 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     // MARK: - Queue rendering target
 
-    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering. visionOS is not named because it has the renderer from 1.0, which is the package floor, so the `*` arm is the renderer arm there and naming it would be a check that is always true.
-    var queueTarget: any AVQueuedSampleBufferRendering {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer
-        }
-        return displayLayer
-    }
+    /// `videoRenderer` as the protocol the enqueue path has always called it through, so the per-frame
+    /// enqueue and back-pressure calls keep the dispatch they had.
+    var queueTarget: any AVQueuedSampleBufferRendering { videoRenderer }
 
-    /// Demux-loop back-pressure gate. Post-tvOS 18 split: reading the layer's own isReadyForMoreMediaData stays optimistically true even when the sampleBufferRenderer queue is full, causing FigVideoQueueRemote -12080 on over-enqueue.
+    /// Demux-loop back-pressure gate. Read from the renderer, never the layer: the layer's own
+    /// isReadyForMoreMediaData stays optimistically true even when the renderer queue is full, causing
+    /// FigVideoQueueRemote -12080 on over-enqueue.
     var isReadyForMoreMediaData: Bool {
         queueTarget.isReadyForMoreMediaData
     }
 
-    private var queueStatus: AVQueuedSampleBufferRenderingStatus {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.status
-        }
-        return displayLayer.status
+    #if DEBUG
+    /// Fork: the cushion pump hands frames to the layer only while the queue target reports ready,
+    /// which a headless test renderer never does. Tests that assert hand-over latency set this.
+    var queueReadinessOverrideForTesting: Bool?
+    #endif
+    private var queueTargetReady: Bool {
+        #if DEBUG
+        if let override = queueReadinessOverrideForTesting { return override }
+        #endif
+        return queueTarget.isReadyForMoreMediaData
     }
 
-    private var queueError: Error? {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.error
-        }
-        return displayLayer.error
-    }
+    private var queueStatus: AVQueuedSampleBufferRenderingStatus { videoRenderer.status }
 
+    private var queueError: Error? { videoRenderer.error }
+
+    @MainActor
     private static func makeDisplayLayer(isHDR: Bool, gravity: AVLayerVideoGravity = .resizeAspect) -> AVSampleBufferDisplayLayer {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = gravity
@@ -376,9 +669,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             layer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                layer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            layer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
         return layer
@@ -390,9 +681,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             displayLayer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                displayLayer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            displayLayer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
     }
@@ -400,6 +689,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func setSkipThreshold(_ time: CMTime?) {
         reorderLock.lock()
         skipUntilPTS = time
+        // Nothing below the threshold will be handed over, and the first frame past it need not be
+        // the lowest one to come, so the floor starts here rather than at that frame.
+        if arrivalFloor != nil, let time, time.isNumeric {
+            arrivalFloor?.reset(start: CMTimeGetSeconds(time))
+            arrivalSkipBelow = CMTimeGetSeconds(time)
+        }
         reorderLock.unlock()
     }
 
@@ -439,6 +734,25 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         let ptsSeconds = CMTimeGetSeconds(pts)
+        if arrivalFloor != nil {
+            handOverOnArrival(pixelBuffer: pixelBuffer, pts: pts, ptsSeconds: ptsSeconds,
+                              hdr10PlusData: hdr10PlusData)
+            return
+        }
+        if let handed = _lastReleasedPtsSeconds, ptsSeconds < handed {
+            _outOfOrderFramesDropped += 1
+            let dropped = _outOfOrderFramesDropped
+            let raised = reorderDepth < Self.hardwareDecoderReorderDepth
+            reorderDepth = Self.hardwareDecoderReorderDepth
+            reorderLock.unlock()
+            if dropped == 1 {
+                EngineLog.emit(
+                    "[Renderer] frame at \(String(format: "%.3f", ptsSeconds))s arrived after \(String(format: "%.3f", handed))s "
+                    + "was handed over; dropped, reorder depth \(raised ? "raised to \(Self.hardwareDecoderReorderDepth)" : "already \(Self.hardwareDecoderReorderDepth)")",
+                    category: .swPlayback)
+            }
+            return
+        }
         // #303: the frontier is the newest timestamp HELD, not the newest handed over. A B-frame run
         // arrives out of order, so taking the last call's timestamp would report a cushion that
         // shrinks and grows with the coding pattern rather than with the buffer.
@@ -457,14 +771,78 @@ final class SampleBufferRenderer: @unchecked Sendable {
         // as the layer asks.
         while reorderBuffer.count > cushionCapFrames {
             let (pb, t, hdr) = reorderBuffer.removeFirst()
+            _lastReleasedPtsSeconds = CMTimeGetSeconds(t)
+            // #407: the successor is already held, so its timestamp is the frame's exact duration at
+            // no extra latency. Read before the unlock, since enqueue() runs on the decode thread.
+            let next = reorderBuffer.first?.1
             reorderLock.unlock()
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
             reorderLock.lock()
         }
 
         reorderLock.unlock()
         startCushionFeederIfNeeded()
         pumpCushion()
+    }
+
+    /// Arrival-order handover (see `arrivalFloor`). Called with `reorderLock` held; returns with it
+    /// released. The frame goes out with no duration: its successor in display order may not have
+    /// arrived yet, and an open-ended frame is what the layer had before #407 anyway. The floor is
+    /// raised after the enqueue, so it never claims a frame that is still on its way in.
+    private func handOverOnArrival(pixelBuffer: CVPixelBuffer, pts: CMTime, ptsSeconds: Double,
+                                   hdr10PlusData: Data?) {
+        if let below = arrivalSkipBelow, ptsSeconds < below {
+            reorderLock.unlock()
+            return
+        }
+        // #303: the newest timestamp admitted, as on the reorder path.
+        if ptsSeconds > (_newestEnqueuedPtsSeconds ?? -.greatestFiniteMagnitude) {
+            _newestEnqueuedPtsSeconds = ptsSeconds
+        }
+        let timeline = _timeline
+        var clock: Double?
+        if let timebase = videoRenderer.timebase as CMTimebase?, CMTimebaseGetRate(timebase) > 0 {
+            let rendererSeconds = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
+            clock = timeline?.sourceSeconds(forRenderer: rendererSeconds) ?? rendererSeconds
+        }
+        guard let step = arrivalFloor?.record(ptsSeconds, clockSeconds: clock) else {
+            reorderLock.unlock()
+            return
+        }
+        if step.belowFloor { _framesBelowFloor += 1 }
+        let belowCount = _framesBelowFloor
+        let floor = arrivalFloor?.floor
+        let generation = _flushGeneration
+        reorderLock.unlock()
+
+        flushFrame(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData,
+                   displayOrderSpacing: step.contiguous)
+        if let raised = step.raisedFloor, #available(visionOS 1.1, *) {
+            let source = CMTime(seconds: raised, preferredTimescale: 90_000)
+            // A flush in between dropped this promise along with the frames it covered; setting it
+            // now would hold the first frame of a backward seek below a pre-seek floor.
+            reorderLock.lock()
+            if generation == _flushGeneration {
+                videoRenderer.presentationTimeExpectation =
+                    .minimumUpcoming(timeline?.rendererTime(forSource: source) ?? source)
+            }
+            reorderLock.unlock()
+        }
+        if step.belowFloor, belowCount == 1 || belowCount % 250 == 0 {
+            EngineLog.emit(
+                "[Renderer] frame at \(String(format: "%.3f", ptsSeconds))s arrived below the promised floor "
+                + "\(String(format: "%.3f", floor ?? .nan))s (\(belowCount) so far); handed over anyway",
+                category: .swPlayback)
+        }
+    }
+
+    /// AE#711 follow-up: the newest frame handed to the layer, before the subtitle compositor, for a
+    /// rebuild to hold when the layer cannot say what it is showing (off screen, or before tvOS 17.4's
+    /// readback has anything). At most one buffer, released by `flush`.
+    private var _lastEnqueuedFrame: CVPixelBuffer?
+    var lastEnqueuedFrame: CVPixelBuffer? {
+        reorderLock.lock(); defer { reorderLock.unlock() }
+        return _lastEnqueuedFrame
     }
 
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
@@ -488,10 +866,20 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
+        _lastEnqueuedFrame = nil
+        // #407: the next frame handed over will not follow the last one, so the gap between them is
+        // not a cadence measurement. Left standing, every seek would report one enormous interval.
+        _lastHandedPtsSeconds = nil
+        _lastReleasedPtsSeconds = nil
+        // The renderer's own flush below also drops the expectation it was given.
+        arrivalFloor?.reset()
+        arrivalSkipBelow = nil
         // #303: nothing is held any more, so the frontier is not a frontier. Left standing, a
         // backward seek would keep reporting the pre-seek timestamp and read as a cushion of
         // however far the seek travelled.
         _newestEnqueuedPtsSeconds = nil
+        gateMaxPacketPTS = nil
+        gateReorderLead = 0   // a seek relearns the lead from the new position
         // #311: everything reported before this point describes frames that are now gone.
         _flushGeneration = SampleBufferRenderer.flushGenerations.next()
         // Invalidate the format description cache; the next load() may open a stream with different colorimetry at the same resolution.
@@ -499,37 +887,50 @@ final class SampleBufferRenderer: @unchecked Sendable {
         cachedFormatKey = nil
         reorderLock.unlock()
 
-        let modern: Bool
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) { modern = true } else { modern = false }
-        switch DisplayFlushOp.resolve(removingDisplayedImage: removingDisplayedImage, modernRenderer: modern) {
-        case .rendererFlush(let remove):
-            if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-                displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: remove) { }
-            }
-        case .removeImage:
-            displayLayer.flushAndRemoveImage()
-        case .holdImage:
-            displayLayer.flush()
-        }
+        videoRenderer.flush(removingDisplayedImage: removingDisplayedImage) { }
     }
 
     /// Send all buffered frames to the display layer (call at EOF).
     func drainReorderBuffer() {
         reorderLock.lock()
+        // Arrival order: nothing is held, but a hole in the last GOP would leave the promise below
+        // the tail with no further frame to move it.
+        if arrivalFloor != nil, #available(visionOS 1.1, *) {
+            videoRenderer.presentationTimeExpectation = .none
+        }
         let remaining = reorderBuffer
         reorderBuffer.removeAll()
+        if let newest = remaining.last { _lastReleasedPtsSeconds = CMTimeGetSeconds(newest.1) }
         reorderLock.unlock()
 
-        for (pb, t, hdr) in remaining {
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+        for (i, (pb, t, hdr)) in remaining.enumerated() {
+            // The final frame has no successor, so it is handed over untimed in length: at end of
+            // media that is the frame that stays on screen, and a length is exactly what it must not
+            // have.
+            let next = i + 1 < remaining.count ? remaining[i + 1].1 : nil
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
         }
     }
 
     // MARK: - Internal
 
-    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?) {
+    /// `displayOrderSpacing` replaces `pts` in the #407 spacing measurement on the arrival-order
+    /// path, where consecutive handovers are in decode order and their gaps say nothing about cadence:
+    /// it lists the timestamps that this frame made contiguous, in the order they will be shown.
+    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?,
+                            nextPTS: CMTime? = nil, displayOrderSpacing: [Double]? = nil) {
         let outputBuffer = subtitleCompositor.composite(pixelBuffer, ptsSeconds: pts.seconds)
-        guard let sampleBuffer = createSampleBuffer(from: outputBuffer, pts: pts) else {
+        reorderLock.lock()
+        let timeline = _timeline
+        reorderLock.unlock()
+        guard let sampleBuffer = createSampleBuffer(
+            from: outputBuffer, pts: timeline?.rendererTime(forSource: pts) ?? pts,
+            duration: Self.frameDuration(from: pts, to: nextPTS)) else {
+            // #407: a frame the decoder produced and the layer never saw. Counted, because the
+            // per-second frame count is taken on the decoder's side of this line.
+            reorderLock.lock()
+            _sampleBuildFailures += 1
+            reorderLock.unlock()
             return
         }
         // HDR10+ attachment overrides any payload baked into the bitstream (VT may strip per-frame SEI on decode).
@@ -572,6 +973,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
             EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
         }
         target.enqueue(sampleBuffer)
+        reorderLock.lock()
+        _lastEnqueuedFrame = pixelBuffer
+        reorderLock.unlock()
 
         // #311: reported here rather than at admission, so it describes frames the compositor has
         // been given. A frame refused for an unschedulable timestamp, skipped after a seek, or lost
@@ -584,10 +988,24 @@ final class SampleBufferRenderer: @unchecked Sendable {
         observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
         sampleTap?(sampleBuffer)
 
+        reorderLock.lock()
         enqueueCount += 1
+        // #407: the spacing of what the layer was given, which is the thing a frame COUNT cannot say.
+        for shown in displayOrderSpacing ?? [CMTimeGetSeconds(pts)] {
+            if let previous = _lastHandedPtsSeconds {
+                let delta = shown - previous
+                if delta.isFinite {
+                    _minHandedDeltaSeconds = min(_minHandedDeltaSeconds, delta)
+                    _maxHandedDeltaSeconds = max(_maxHandedDeltaSeconds, delta)
+                }
+            }
+            _lastHandedPtsSeconds = shown
+        }
+        let handed = enqueueCount
+        reorderLock.unlock()
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
-        if enqueueCount == 1 || enqueueCount == 30 || enqueueCount == 100 || enqueueCount == 1000 || enqueueCount == 5000 {
-            EngineLog.emit("[Renderer] enqueue #\(enqueueCount): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
+        if handed == 1 || handed == 30 || handed == 100 || handed == 1000 || handed == 5000 {
+            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
         }
     }
 
@@ -612,8 +1030,21 @@ final class SampleBufferRenderer: @unchecked Sendable {
             desc, usePixelAspectRatio: true, useCleanAperture: true)
     }
 
+    /// #407: the length a frame is presented for, from the successor the reorder buffer is already
+    /// holding. `.invalid` for the last frame of a stream (nothing follows it) and for a successor
+    /// that cannot be a frame length: a non-positive gap is a duplicate or a reordering fault, and a
+    /// gap past a second is a stream discontinuity, neither of which is a duration to present for.
+    static func frameDuration(from pts: CMTime, to nextPTS: CMTime?) -> CMTime {
+        guard let nextPTS, pts.isNumeric, nextPTS.isNumeric else { return .invalid }
+        let delta = CMTimeSubtract(nextPTS, pts)
+        let seconds = CMTimeGetSeconds(delta)
+        guard seconds > 0, seconds <= 1.0 else { return .invalid }
+        return delta
+    }
+
     /// Internal (not private) for #177 regression tests: the PAR-keyed cache behavior is the fix.
-    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
+    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime,
+                            duration: CMTime = .invalid) -> CMSampleBuffer? {
         // Cache hit avoids CMVideoFormatDescriptionCreateForImageBuffer allocation + CF refcount churn on every frame.
         let par = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil) as? NSDictionary
         let key = FormatDescriptionKey(
@@ -659,7 +1090,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         var timing = CMSampleTimingInfo(
-            duration: .invalid,
+            duration: duration,
             presentationTimeStamp: pts,
             decodeTimeStamp: .invalid
         )

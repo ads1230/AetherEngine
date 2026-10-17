@@ -2,10 +2,10 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
-import Libavformat
-import Libavcodec
-import Libavutil
-import Libswscale
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswscale
 
 /// libavcodec software video decoder for codecs without VideoToolbox support (e.g. AV1/dav1d on Apple TV).
 /// Uses sws_scale (SIMD/NEON-optimized) for YUV→NV12/P010 conversion; required to hit 24fps at 1080p for AV1.
@@ -21,6 +21,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var seenHDR10Plus = false
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+
+    /// AE#658: fires (decode thread) on the first displayed frame and whenever the decoded format or the
+    /// display buffer's format changes. Guarded by `lock`, like everything `emit` reads.
+    var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
+    private var decodedFormatKey: DecodedFormatKey?
+    private var reportedFormatKey: DecodedFormatKey?
+
+    /// The decoder's own output, taken before a deinterlace graph can rewrite the frame (the hardware
+    /// graph hands `emit` a VideoToolbox surface whose pixel format says nothing about the decode).
+    struct DecodedFormatKey: Equatable {
+        var pixelFormat: Int32
+        var color: ColorDescription
+        var pixelBufferType: OSType = 0
+    }
 
     /// True when the source is >8-bit (HDR10, AV1 HDR).
     private var use10Bit = false
@@ -41,6 +55,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
+    private var poolFormat = OutputFormat(tenBit: false, fullRange: false)
+    /// The format the last converted frame asked for, so a change is logged once (release-visible) rather
+    /// than per frame. Guarded by `lock`, like the pool.
+    private var loggedOutputFormat: OutputFormat?
 
     /// Skip pre-seek frames; decoded for reference but not converted.
     /// Guarded by `skipLock` not `lock`: emit() runs with `lock` held, so a same-lock accessor would deadlock.
@@ -50,6 +68,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
     }
     private var _skipUntilPTS: CMTime?
+
+    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
+    private var _feedEpoch: UInt64 = 0
+    var feedEpoch: UInt64 {
+        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    }
     private let skipLock = NSLock()
 
     /// Clear the skip threshold only if it is still the one we acted on.
@@ -78,8 +102,66 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// applied to the filter there (mutating it mid-stream would need a graph rebuild).
     var deinterlaceConfig = DeinterlaceConfig()
 
+    /// #544: decode on the calling thread with no frame-level threading. Set before `open`; the
+    /// still extractor is the only caller, everything on a playback path wants the parallel default.
+    var decodesSingleThreaded = false
+
+    /// The pixel buffer format this decoder hands the display layer, read off the decoded frame (audit
+    /// DEC-107). The container's declaration alone missed two cases: `color_range` was never read, so a
+    /// full-range AV1 / VP9 / HEVC picture was labelled video range and shown crushed, and
+    /// `bits_per_raw_sample` is 0 for libdav1d and the AV1 / VP9 parsers, so a 10-bit SDR stream was
+    /// dithered down to 8 bit.
+    struct OutputFormat: Equatable {
+        var tenBit: Bool
+        var fullRange: Bool
+
+        var pixelFormatType: OSType {
+            switch (tenBit, fullRange) {
+            case (false, false): return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            case (false, true): return kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            case (true, false): return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            case (true, true): return kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            }
+        }
+
+        var swscaleFormat: AVPixelFormat { tenBit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12 }
+    }
+
+    /// `streamIs10Bit` is the open-time verdict (declared depth or an HDR transfer) and only ever widens
+    /// the answer. The range is a LABEL: the legacy `sws_scale` reads a source's range from the pixel
+    /// format alone (the yuvj family), so a full-range frame in a plain 4:2:0 format is copied across
+    /// untouched and only has to be tagged as what it is. Asking swscale to convert would take 4K off its
+    /// unscaled NV12 / P010 path, and a yuvj source IS converted to video range by swscale itself, so it
+    /// stays video range here.
+    nonisolated static func outputFormat(pixelFormat: Int32, colorRange: AVColorRange,
+                                         streamIs10Bit: Bool) -> OutputFormat {
+        let format = AVPixelFormat(rawValue: pixelFormat)
+        let depth = av_pix_fmt_desc_get(format)?.pointee.comp.0.depth ?? 8
+        let convertedBySwscale: Bool
+        switch format {
+        case AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P:
+            convertedBySwscale = true
+        default:
+            convertedBySwscale = false
+        }
+        return OutputFormat(tenBit: streamIs10Bit || depth > 8,
+                            fullRange: colorRange == AVCOL_RANGE_JPEG && !convertedBySwscale)
+    }
+
+    /// AE#499: what the container declared about colour, captured at `open` before a single frame
+    /// exists. A decoded frame carries the VUI alone, and a remux whose VUI is empty would otherwise
+    /// reach `attachColorSpace` as an untagged picture, so an HDR10 file decoded in software lost its
+    /// PQ / BT.2020 attachments while the same file through the hardware decoder (which reads
+    /// `codecpar`) kept them. Written once in `open`, before the host can feed a packet, and read on
+    /// the decode thread afterwards, the same discipline `use10Bit` and the other open-time fields keep.
+    private var containerColor = ColorDescription.unspecified
+
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
+
+    /// #407: frames whose PTS was reconstructed from `best_effort_timestamp` (see the repair site
+    /// in drainDecodedFrames()). Guarded by `lock`.
+    private var repairedTimestamps = 0
 
     /// GPU-side copy from the hw-deinterlace filter's pool buffers into `pixelBufferPool` (see
     /// the VT branch in emit()). Created lazily on the first hw frame; guarded by `lock`.
@@ -195,8 +277,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             return AV_PIX_FMT_YUV420P
         }
 
-        ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
-        ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+        if decodesSingleThreaded {
+            // #544: a still run is one short GOP decoded once. Frame-level threading buys throughput
+            // nobody is waiting for and costs output delay plus a second worker pool.
+            ctx.pointee.thread_count = 1
+            ctx.pointee.thread_type = 0
+        } else {
+            ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
+            ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+        }
 
         // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
         var opts: OpaquePointer?
@@ -234,12 +323,25 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
 
+        containerColor = ColorDescription(codecpar: codecpar)
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
+    }
+
+    /// #407: the timestamp to put on a decoded frame that carries none, or nil when the frame is
+    /// already timed (the common case, and the one that must stay untouched: a decoder-set PTS is
+    /// always at least as good as the reconstruction, and `best_effort_timestamp` can trail it).
+    ///
+    /// `AV_NOPTS_VALUE` is `Int64.min`. `best_effort_timestamp` is libavcodec's own
+    /// `guess_correct_pts(pts, pkt_dts)`, so a frame with neither cannot be timed by any means the
+    /// decoder has and stays unschedulable; the layer below drops it rather than wedging the queue.
+    static func repairedPTS(pts: Int64, bestEffort: Int64) -> Int64? {
+        guard pts == Int64.min, bestEffort != Int64.min else { return nil }
+        return bestEffort
     }
 
     /// What to do with a packet after `avcodec_send_packet` returned `ret` (#220).
@@ -266,16 +368,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// an error, and returning on it both dropped the packet and left the output queue full, so
     /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
     /// the decoder, while audio kept playing.
-    func decode(packet: UnsafeMutablePointer<AVPacket>) {
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
+        // AE#492: a packet decided on before a flush must not be sent after it; `flush()` takes this
+        // lock to retire the epoch, so either the send happens first and the flush drops what it
+        // produced, or the flush happens first and the send never runs.
+        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
         let bsf = packedBFrameFilter
         let manual = manualUnpackEnabled
         lock.unlock()
         guard let bsf else {
             if manual {
-                decodeUnpackingPackedBFrames(packet)
+                decodeUnpackingPackedBFrames(packet, epoch: epoch)
             } else {
-                sendAndDrain(packet: packet)
+                sendAndDrain(packet: packet, epoch: epoch)
             }
             return
         }
@@ -283,14 +389,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // the caller's packet blank — the caller's unref is then a no-op.
         // On filter refusal the packet is untouched; decode it unfiltered.
         guard av_bsf_send_packet(bsf, packet) >= 0 else {
-            sendAndDrain(packet: packet)
+            sendAndDrain(packet: packet, epoch: epoch)
             return
         }
         var out = av_packet_alloc()
         defer { av_packet_free(&out) }
         guard let outPkt = out else { return }
         while av_bsf_receive_packet(bsf, outPkt) >= 0 {
-            sendAndDrain(packet: outPkt)
+            sendAndDrain(packet: outPkt, epoch: epoch)
             av_packet_unref(outPkt)
         }
     }
@@ -313,10 +419,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// followed by a normal frame emitted pictures into the WRONG timeslots:
     /// perfectly spaced pts, wrong image per slot — continuous motion jitter
     /// invisible to every timing probe.
-    private func decodeUnpackingPackedBFrames(_ packet: UnsafeMutablePointer<AVPacket>) {
+    private func decodeUnpackingPackedBFrames(_ packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64?) {
         let size = Int(packet.pointee.size)
         guard size > 0, let data = packet.pointee.data else {
-            sendAndDrain(packet: packet)
+            sendAndDrain(packet: packet, epoch: epoch)
             return
         }
         let scan = Self.scanVOPs(data: data, size: size)
@@ -361,7 +467,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             out.pointee.duration = packet.pointee.duration
             out.pointee.stream_index = packet.pointee.stream_index
             out.pointee.flags = packet.pointee.flags
-            sendAndDrain(packet: out)
+            sendAndDrain(packet: out, epoch: epoch)
             return
         }
 
@@ -373,10 +479,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // Send the leading VOP of the pair under its own timestamps.
             packet.pointee.size = Int32(split)
         }
-        sendAndDrain(packet: packet)
+        sendAndDrain(packet: packet, epoch: epoch)
     }
 
-    private func sendAndDrain(packet: UnsafeMutablePointer<AVPacket>) {
+    private func sendAndDrain(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
         guard let ctx = codecContext else { lock.unlock(); return }
         var sendRet = avcodec_send_packet(ctx, packet)
@@ -385,6 +491,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if Self.disposition(forSendResult: sendRet) == .drainAndRetry {
             drainDecodedFrames()
             lock.lock()
+            // Audit DEC-1: the drain drops the lock between frames, so a flush can land in it.
+            if let epoch, epoch != _feedEpoch { lock.unlock(); return }
             sendRet = codecContext == nil ? FFmpegErr.einval : avcodec_send_packet(ctx, packet)
             lock.unlock()
         }
@@ -414,6 +522,34 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
             guard ret >= 0 else { lock.unlock(); break }
+
+            // AE#499: fill the fields the VUI left open from the container's declaration BEFORE any
+            // consumer reads the frame, for the same reason the timestamp repair below runs here.
+            ColorDescription.backfill(frame: f, container: containerColor)
+            decodedFormatKey = DecodedFormatKey(pixelFormat: f.pointee.format, color: ColorDescription(frame: f))
+
+            // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches
+            // the renderer with no PTS is unschedulable and gets dropped there, so every consumer
+            // below (captions, the deinterlace graph, emit) has to see the repaired value, not just
+            // the one that happens to be looked at last. `best_effort_timestamp` is libavcodec's
+            // guess_correct_pts(pts, pkt_dts), the same reconstruction every other FFmpeg-based
+            // player consumes, and it is the only timestamp left when the container carried decode
+            // timestamps alone: Matroska V_MS/VFW/FOURCC tracks (VC-1, the legacy MS codecs) put the
+            // block time in DTS, and live MPEG-TS delivers untimed pictures outright. The demuxer's
+            // `+genpts` normally fills those in a packet earlier; this is the layer that has to hold
+            // when it cannot (an open that never got the flag, a frame the reconstruction skipped).
+            if let repaired = Self.repairedPTS(
+                pts: f.pointee.pts, bestEffort: f.pointee.best_effort_timestamp
+            ) {
+                f.pointee.pts = repaired
+                repairedTimestamps += 1
+                if repairedTimestamps == 1 || repairedTimestamps % 250 == 0 {
+                    EngineLog.emit(
+                        "[SWDecoder] repaired \(repairedTimestamps) frame timestamp(s) from best_effort_timestamp",
+                        category: .swPlayback
+                    )
+                }
+            }
 
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
             // picture user data and friends). Presentation order by construction of decoder output.
@@ -511,12 +647,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     private func emitInner(_ f: UnsafeMutablePointer<AVFrame>, timeBase tb: AVRational) {
-        if let threshold = skipUntilPTS, f.pointee.pts != Int64.min {
-            let framePTS = CMTimeMake(
-                value: f.pointee.pts * Int64(tb.num),
-                timescale: Int32(tb.den)
-            )
-            if CMTimeCompare(framePTS, threshold) < 0 {
+        let cmPTS = SourceTimestampBounds.cmTime(ticks: f.pointee.pts, timeBase: tb)
+        if let threshold = skipUntilPTS, cmPTS.isValid {
+            if CMTimeCompare(cmPTS, threshold) < 0 {
                 return
             }
             // Compare-and-clear: a concurrent seek can install a new threshold; blindly nil-ing would discard it.
@@ -552,16 +685,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             pixelBuffer = converted
         }
 
-        let pts = f.pointee.pts
-        let cmPTS: CMTime
-        if pts != Int64.min {
-            cmPTS = CMTimeMake(
-                value: pts * Int64(tb.num),
-                timescale: Int32(tb.den)
-            )
-        } else {
-            cmPTS = .invalid
-        }
+        reportDecodedFormat(pixelBuffer: pixelBuffer)
 
         // HDR10+: read dynamic metadata from post-decode AVFrame side data (T.35 SEI bytes).
         // Can't reuse the VT path's packet-side stash; this decoder owns its own packet flow.
@@ -574,11 +698,24 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         onFrame?(pixelBuffer, cmPTS, hdr10PlusData)
     }
 
+    /// #544: `resetFilterGraph: false` keeps the deinterlace graph across the flush. The still
+    /// extractor flushes before every run, and rebuilding the graph means a fresh Metal pipeline, a
+    /// fresh full-resolution hwframes pool AND an unconditional `[Deinterlace] engaged` line, about
+    /// sixteen times a second while a viewer holds the scrub. That line alone overwrites a host's
+    /// whole diagnostic ring in half a minute. A still run decodes a full GOP and returns the frame
+    /// at its target, so the filter has context from this position by the time that frame is made.
     func flush() {
+        flush(resetFilterGraph: true)
+    }
+
+    func flush(resetFilterGraph: Bool) {
         lock.lock()
         defer { lock.unlock() }
+        // AE#492: retires every packet a caller had already decided to send. Bumped under the lock,
+        // so a feed that has not reached `avcodec_send_packet` yet is refused from here on.
+        _feedEpoch &+= 1
         // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
-        deinterlacer.teardown()
+        if resetFilterGraph { deinterlacer.teardown() }
         ivtc.teardown()
         if let bsf = packedBFrameFilter { av_bsf_flush(bsf) }
         stashedPackedB = nil
@@ -634,6 +771,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
+        loggedOutputFormat = nil
         if let session = transferSession {
             VTPixelTransferSessionInvalidate(session)
             transferSession = nil
@@ -652,16 +790,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Create (or reuse) the decoder-owned CVPixelBufferPool for the given geometry. These
     /// attributes (IOSurface + Metal compatible, NV12/P010) are the ones the display path has
     /// always accepted; both the sws path and the hw-deinterlace transfer draw from here.
-    private func ensurePixelBufferPool(width: Int, height: Int) -> CVPixelBufferPool? {
-        let cvPixelFormat: OSType = use10Bit
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-
-        if pixelBufferPool == nil || poolWidth != width || poolHeight != height {
+    private func ensurePixelBufferPool(width: Int, height: Int, format: OutputFormat) -> CVPixelBufferPool? {
+        if pixelBufferPool == nil || poolWidth != width || poolHeight != height || poolFormat != format {
             pixelBufferPool = nil
             let poolAttrs: NSDictionary = [kCVPixelBufferPoolMinimumBufferCountKey: 6]
             let pbAttrs: NSDictionary = [
-                kCVPixelBufferPixelFormatTypeKey: cvPixelFormat,
+                kCVPixelBufferPixelFormatTypeKey: format.pixelFormatType,
                 kCVPixelBufferWidthKey: width,
                 kCVPixelBufferHeightKey: height,
                 kCVPixelBufferMetalCompatibilityKey: true,
@@ -670,6 +804,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs, pbAttrs, &pixelBufferPool)
             poolWidth = width
             poolHeight = height
+            poolFormat = format
         }
         return pixelBufferPool
     }
@@ -684,16 +819,33 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard status == noErr, let s = session else { return nil }
             transferSession = s
         }
+        // The transfer converts range and depth itself, so it asks for the stream's own default.
         guard let session = transferSession,
               let pool = ensurePixelBufferPool(
                   width: CVPixelBufferGetWidth(src),
-                  height: CVPixelBufferGetHeight(src)
+                  height: CVPixelBufferGetHeight(src),
+                  format: OutputFormat(tenBit: use10Bit, fullRange: false)
               ) else { return nil }
         var dst: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst) == kCVReturnSuccess,
               let out = dst else { return nil }
         guard VTPixelTransferSessionTransferImage(session, from: src, to: out) == noErr else { return nil }
         return out
+    }
+
+    private func reportDecodedFormat(pixelBuffer: CVPixelBuffer) {
+        guard let onDecodedFormat, var key = decodedFormatKey else { return }
+        key.pixelBufferType = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard key != reportedFormatKey else { return }
+        reportedFormatKey = key
+        onDecodedFormat(DecodedVideoFormat(
+            frame: VideoStreamFormat(
+                pixelFormat: AVPixelFormat(rawValue: key.pixelFormat),
+                declaredBitDepth: 0,
+                color: key.color,
+                codecID: codecContext?.pointee.codec_id ?? AV_CODEC_ID_NONE,
+                profile: codecContext?.pointee.profile ?? AV_PROFILE_UNKNOWN),
+            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType)))
     }
 
     // MARK: - AVFrame → CVPixelBuffer (sws_scale)
@@ -705,7 +857,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         let srcFmt = AVPixelFormat(rawValue: frame.pointee.format)
 
-        let dstFmt = use10Bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12
+        let outputFormat = Self.outputFormat(
+            pixelFormat: frame.pointee.format, colorRange: frame.pointee.color_range, streamIs10Bit: use10Bit)
+        let dstFmt = outputFormat.swscaleFormat
+        if outputFormat != loggedOutputFormat {
+            loggedOutputFormat = outputFormat
+            EngineLog.emit(
+                "[SWDecoder] output \(outputFormat.tenBit ? "10-bit P010" : "8-bit NV12"), "
+                + "\(outputFormat.fullRange ? "full" : "video") range "
+                + "(frame \(av_get_pix_fmt_name(srcFmt).map { String(cString: $0) } ?? "?"), "
+                + "color_range=\(frame.pointee.color_range.rawValue))",
+                category: .swPlayback
+            )
+        }
 
         swsContext = sws_getCachedContext(
             swsContext,
@@ -718,7 +882,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard swsContext != nil else { return nil }
 
         var pixelBuffer: CVPixelBuffer?
-        guard let pool = ensurePixelBufferPool(width: width, height: height) else { return nil }
+        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
         let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
         guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
 
@@ -774,20 +938,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // MARK: - Color Space Metadata
 
     /// Map FFmpeg color metadata to CVPixelBuffer attachments for correct HDR10 rendering (BT.2020 + PQ).
+    /// Every field is written, a gap included (AE#654): VideoToolbox never hands the display layer an
+    /// untagged buffer, and neither may this decoder.
     private func attachColorSpace(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        let primaries = ColorAttachments.primaries(frame.pointee.color_primaries)
-        let transfer = ColorAttachments.transfer(frame.pointee.color_trc)
-        let matrix = ColorAttachments.matrix(frame.pointee.colorspace)
-
-        if let primaries {
-            CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
-        }
-        if let transfer {
-            CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
-        }
-        if let matrix {
-            CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
-        }
+        let tags = ColorAttachments.presented(ColorDescription(frame: frame))
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
     }
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)

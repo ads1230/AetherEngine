@@ -16,8 +16,34 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     /// EXT-X-TARGETDURATION in seconds, nil until the resolver has fetched the first media playlist. This
     /// is the upstream's *self-declared* value: a valid lower bound on segment duration, but NOT evidence
     /// of real delivery cadence. Use `observedLiveCadenceSeconds` for blocking-reload / TARGETDURATION
-    /// shaping (AetherEngine#167).
+    /// shaping (AetherEngine#167). Nothing derives from it: since AE#447 it is reported in the seal log
+    /// and nowhere else, because a packager's habitual `segment + 1` padding used to become the session's
+    /// served TARGETDURATION and cost `3 x` itself in first-serve holdback.
     var upstreamTargetDuration: Double? { get }
+
+    /// Longest CLOSED inter-arrival interval observed, nil until one has closed. Unlike
+    /// `observedLiveCadenceSeconds` this excludes the currently-open gap, which inside the first-serve
+    /// gate measures the engine's own wait rather than the source's cadence (AE#447).
+    var closedLiveCadenceSeconds: Double? { get }
+
+    /// Longest segment duration (EXTINF) the upstream has actually SERVED, nil until the first arrival.
+    /// The measured counterpart to `upstreamTargetDuration`. Two things are read off it: a bound on
+    /// the steady-state cadence when a join burst makes the arrival intervals look shorter than they
+    /// will ever be (an upstream cutting 4 s segments cannot sustain 0.5 s, AE#447), and the unit the
+    /// source delivers in, which the served TARGETDURATION covers whole (AE#684).
+    var upstreamSegmentDurationSeconds: Double? { get }
+
+    /// Summed EXTINF of the segments this reader joined with, nil until it has joined. Reported in
+    /// the seal line; nothing is decided from it, because an upstream's EXTINF and its media need
+    /// not agree (AE#684).
+    var joinBacklogSeconds: Double? { get }
+
+    /// Whether the join has been handed over in full AND consumed: every byte of the join batch has
+    /// been committed to the reader (and to its companion audio reader, where there is one), and the
+    /// consumer is parked on an empty reader, either of the two, waiting for the next upstream
+    /// delivery. From then on nothing more can be cut until that delivery, which is
+    /// what the first-serve gate needs to know before it waits for a deeper cushion (AE#684).
+    var joinIsSpent: Bool { get }
 
     /// OBSERVED upstream segment-arrival cadence in seconds (recent max inter-arrival interval, widened by
     /// the currently-open gap), nil until the first arrival. Unlike `upstreamTargetDuration` this reflects
@@ -32,6 +58,10 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     /// source is a direct media playlist (AE#359). Set by the resolver before any main-stream byte
     /// flows, like `companionAudioReader`, so it is final once the load reads it.
     var subtitleRenditions: [LiveSubtitleRenditionInfo] { get }
+
+    /// The URL the host gave the reader's headers for. A sibling rendition fetch sends the credential
+    /// headers only to this origin, like the reader's own fetches (audit Vcred-101).
+    var credentialOrigin: URL { get }
 
     /// EXT-X-PROGRAM-DATE-TIME of the segment this reader joined at, nil when the upstream carries no
     /// PDT. Together with the engine's clock at session start this is the wall-to-player mapping a

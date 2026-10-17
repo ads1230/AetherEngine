@@ -9,8 +9,14 @@ import Foundation
 /// through the source URL for a fresh redirect.
 ///
 /// `.serialized`: the rate-limit case mutates the process-wide backoff-scale test hook.
-@Suite("Resolved-URL invalidation on hard server errors", .serialized)
+@Suite("Resolved-URL invalidation on hard server errors", .serialized, .offCooperativePool)
 struct ResolvedURLInvalidationTests {
+
+    /// These tests drive real 429 and 509 answers, and each one arms the request-rate pacer's
+    /// wall-clock quiet ladder. Their subject is the resolved-URL verdict, not that ladder, so it is
+    /// pinned away: unpinned it added 44 s to a single test here and blocked a reader thread for all
+    /// of it. `.serialized` above already declares this suite a mutator of process-wide test hooks.
+    init() { OriginRequestBudget.shared.quietPeriodCapForTesting = 0 }
 
     private final class AttemptCounter: @unchecked Sendable {
         private let lock = NSLock()
@@ -466,15 +472,7 @@ struct ResolvedURLInvalidationTests {
         // The bounded range plus the speculative 64 KB suffix is everything the open fetches, and
         // the range cannot overrun its bound, so this total is reached only once both are done.
         let openBytes = firstRange + 64 * 1024
-        var written: Int64 = 0
-        var polls = 0
-        while written < openBytes, polls < 400 {
-            try await Task.sleep(for: .milliseconds(25))
-            written = cdn.bytesWritten
-            polls += 1
-        }
-        #expect(written >= openBytes,
-                "the opening fetches never completed; the origin wrote \(written) of \(openBytes)")
+        try await waitFor { cdn.bytesWritten >= openBytes }
 
         // Idle past the threshold, then let the lease die. Every wait here is a LOWER bound, so a
         // slow machine only makes the pin more idle, never less.
@@ -518,5 +516,29 @@ struct ResolvedURLInvalidationTests {
         #expect(AVIOReader.isRateLimitStatus(503))
         #expect(AVIOReader.isRateLimitStatus(509))
         #expect(!AVIOReader.isRateLimitStatus(500))
+    }
+
+    /// #405 (Syravo field trace): a 407 from the PINNED media host of a redirect chain fell through
+    /// all three classifiers. No pin drop from the status, counted against the full mid-stream cap
+    /// of 12, and the pin dropped only later by the unproductive-streak rule, so the first attempt
+    /// after the refusal went back to the address that had just refused. The request went out
+    /// direct (CFNetwork logs it as an unexpected proxy response), so on that chain 407 cannot mean
+    /// "authenticate to your proxy": the lease is gone, and re-resolving is the only move that
+    /// works.
+    @Test("407, 402 and 451 are resolved-address expiry, not transients")
+    func leaseRefusalsClassifyAsExpiry() {
+        #expect(AVIOReader.isResolvedExpiryStatus(407), "the field case: a stale lease on a pinned target")
+        #expect(AVIOReader.isResolvedExpiryStatus(402), "panels answer an expired subscription per edge")
+        #expect(AVIOReader.isResolvedExpiryStatus(451), "a geo-refusing edge node; the source still mints working ones")
+        #expect(AVIOReader.isResolvedExpiryStatus(401))
+        #expect(AVIOReader.isResolvedExpiryStatus(403))
+        #expect(AVIOReader.isResolvedExpiryStatus(404))
+        #expect(AVIOReader.isResolvedExpiryStatus(410))
+        #expect(!AVIOReader.isResolvedExpiryStatus(429), "metering is not expiry; re-resolving spends the request there is no room for (#307)")
+        #expect(!AVIOReader.isResolvedExpiryStatus(503))
+        #expect(!AVIOReader.isResolvedExpiryStatus(509))
+        #expect(!AVIOReader.isResolvedExpiryStatus(500), "5xx has its own class and its own reason string")
+        #expect(!AVIOReader.isResolvedExpiryStatus(200))
+        #expect(!AVIOReader.isResolvedExpiryStatus(206))
     }
 }

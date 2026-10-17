@@ -18,6 +18,9 @@
 #   restart-witness-subs.mkv      - same as MKV with an embedded SRT track (pump tap)
 #   a53-captions.mp4              - H.264 with in-picture A/53 CEA-608 SEI (#131, #259)
 #   hev1-inband-xps.mp4           - HEVC with in-band VPS/SPS/PPS and an empty hvcC
+#   cue-axis-bframes.mkv/.mp4     - one HEVC B-pyramid stream in both containers (AE#561)
+#   long-first-gop-{aac,pcm}.mkv  - 11 s first GOP, then 2 s GOPs; passthrough and bridged audio
+#   bridge-eac3-51.mkv            - 5.1 PCM in MKV, drives the EAC3 audio bridge (AE#561 follow-up)
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
 # own library. Drop those into ./Fixtures/user/ (also gitignored)
@@ -76,12 +79,26 @@ ffmpeg -hide_banner -loglevel error -y \
     -tag:v hvc1 \
     "$FIXTURES_DIR/hdr10-hevc.mp4"
 
-# AV1 SDR 1080p
-echo "→ av1.mp4 (AV1 1080p @ 24fps, low CPU preset)"
-ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "testsrc2=size=1920x1080:rate=24" \
-    -t 5 -c:v libaom-av1 -crf 30 -b:v 0 -cpu-used 8 \
-    "$FIXTURES_DIR/av1.mp4"
+# AV1 SDR 1080p. Either AV1 encoder will do, the fixture only has to BE AV1.
+# Homebrew's ffmpeg ships libsvtav1 and, depending on the formula's options, no
+# libaom, and under `set -e` that missing encoder used to abort the whole run and
+# leave the corpus half regenerated.
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " libaom-av1 "; then
+    AV1_ENC=(-c:v libaom-av1 -crf 30 -b:v 0 -cpu-used 8)
+elif ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " libsvtav1 "; then
+    AV1_ENC=(-c:v libsvtav1 -crf 30 -preset 10)
+else
+    AV1_ENC=()
+fi
+if [ ${#AV1_ENC[@]} -gt 0 ]; then
+    echo "→ av1.mp4 (AV1 1080p @ 24fps, low CPU preset)"
+    ffmpeg -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=size=1920x1080:rate=24" \
+        -t 5 "${AV1_ENC[@]}" \
+        "$FIXTURES_DIR/av1.mp4"
+else
+    echo "→ av1.mp4 SKIPPED (no libaom-av1 and no libsvtav1 in this ffmpeg)"
+fi
 
 # VP9 SDR 1080p
 echo "→ vp9.webm (VP9 1080p @ 24fps)"
@@ -266,6 +283,37 @@ data[start:start + size] = replacement
 open(path, 'wb').write(bytes(data))
 PY
 
+# AE#561: one HEVC elementary stream in both containers, so the only difference between the two
+# files is what their index entries are stamped on. A Matroska Cue stores a presentation time, a
+# mov/mp4 sample table stores decode times, and the keyframe-aligned plan's boundaries ARE those
+# entries. B-frames (b-pyramid) are what makes the two axes differ at all; a dense keyint puts an
+# IRAP well inside every 4 s segment, so a segment that lost its own IRAP still carries a later one
+# and the defect shows as "opens below its first random-access point" rather than as no picture.
+# The .mp4 is a stream copy on purpose: same packets, same timestamps, different index stamping.
+echo "→ cue-axis-bframes.mkv + .mp4 (HEVC B-pyramid, same stream in both containers, 16s)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=480x270:rate=24" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 16 \
+    -c:v libx265 -preset ultrafast -pix_fmt yuv420p \
+    -x265-params "keyint=21:min-keyint=21:scenecut=0:bframes=4:b-pyramid=1:log-level=none" \
+    -c:a aac -b:a 96k "$FIXTURES_DIR/cue-axis-bframes.mkv"
+ffmpeg -hide_banner -loglevel error -y \
+    -i "$FIXTURES_DIR/cue-axis-bframes.mkv" -c copy \
+    "$FIXTURES_DIR/cue-axis-bframes.mp4"
+
+# AE#561 follow-up: multichannel PCM in Matroska, which routes audio through the bridge in
+# surround-compat mode, so the encoder is EAC3 rather than FLAC. That distinction is the whole
+# point: FFmpeg's AC-3 family declares `initial_padding = 256` and stamps its first packet a
+# padding below the frame it encoded, while FLAC declares none. 5.1 because the mode only reaches
+# for EAC3 above two channels.
+echo "→ bridge-eac3-51.mkv (5.1 PCM in MKV, drives the EAC3 bridge, 8s)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=320x180:rate=24" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 8 \
+    -c:v libx264 -preset veryfast -g 48 -pix_fmt yuv420p -b:v 200k \
+    -af "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0" \
+    -c:a pcm_s24le "$FIXTURES_DIR/bridge-eac3-51.mkv"
+
 # AetherEngine#268: finite HEVC-in-MPEG-TS HLS VOD, the carriage AVFoundation refuses to build a
 # video track for. Three shapes, because each one only shows its own defect:
 #   hls-hevc-vod/        PTS origin at ffmpeg's default 1.4 s, 6 s segments, 2 s GOP
@@ -322,6 +370,21 @@ ffmpeg -hide_banner -loglevel error -y -copyts -i "$OFFSET_TS" -c copy \
     -f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type vod \
     -hls_segment_filename "$FIXTURES_DIR/user/hls-hevc-vod-offset/seg%03d.ts" \
     "$FIXTURES_DIR/user/hls-hevc-vod-offset/media.m3u8"
+
+# A sequential origin's playlist is cut on video keyframes. A first GOP far longer than the 4 s stride
+# is the shape a remote MKV had (11.3 s). Served forward-only its Cues are never read, so the plan is
+# the uniform stride and audio reaches every boundary long before a keyframe does. One clip per audio
+# path: AAC is passed through, stereo PCM goes through the FLAC bridge (the reporter's Vorbis did).
+for AUDIO in aac pcm; do
+    CODEC=aac; [ "$AUDIO" = pcm ] && CODEC=pcm_s16le
+    echo "→ long-first-gop-$AUDIO.mkv (keyframes at 0, 11, 13, 15 ... s, 30 s)"
+    ffmpeg -hide_banner -loglevel error -y \
+        -f lavfi -i "testsrc2=size=320x180:rate=24" \
+        -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 30 \
+        -c:v libx264 -preset veryfast -pix_fmt yuv420p -b:v 200k -bf 0 \
+        -g 1000 -sc_threshold 0 -force_key_frames "0,11,13,15,17,19,21,23,25,27,29" \
+        -c:a "$CODEC" -ac 2 -f matroska "$FIXTURES_DIR/long-first-gop-$AUDIO.mkv"
+done
 
 echo ""
 echo "Done. Try:"

@@ -14,6 +14,14 @@ enum H264SPS {
         parse(fromNAL: nal)?.frameMbsOnly
     }
 
+    /// The part of an SPS a decoder session is built from: profile_idc and every field from
+    /// chroma_format_idc through the cropping window, packed bit for bit. Constraint flags, level_idc,
+    /// the set's ID and the VUI are left out, since a change confined to them plays on the native
+    /// route with the original sample description (#785 follow-up, measured on macOS).
+    static func decoderSignature(fromNAL nal: [UInt8]) -> [UInt8]? {
+        parse(fromNAL: nal)?.signature
+    }
+
     /// First SPS NAL (incl. 1-byte header) from codecpar extradata, accepting both layouts: Annex-B
     /// (MPEG-TS, start-code delimited) and avcC (MP4/MKV, configurationVersion byte 0x01 then
     /// length-prefixed parameter sets). Returns nil when neither layout yields an SPS.
@@ -31,7 +39,7 @@ enum H264SPS {
         return extradata.withUnsafeBufferPointer { extractSPSandPPS(fromAnnexB: $0)?.sps }
     }
 
-    private static func parse(fromNAL nal: [UInt8]) -> (width: Int, height: Int, frameMbsOnly: Bool)? {
+    private static func parse(fromNAL nal: [UInt8]) -> (width: Int, height: Int, frameMbsOnly: Bool, signature: [UInt8])? {
         guard nal.count > 1, (nal[0] & 0x1f) == 7 else { return nil }
         let rbsp = unescape(Array(nal[1...]))  // strip NAL header + emulation-prevention (00 00 03 -> 00 00)
         var r = BitReader(rbsp)
@@ -40,6 +48,7 @@ enum H264SPS {
         _ = r.u(8)                  // constraint flags + reserved
         _ = r.u(8)                  // level_idc
         guard r.ue() != nil else { return nil } // seq_parameter_set_id
+        let coreStart = r.position
 
         var chromaFormatIdc = 1
         let highProfiles: Set<Int> = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]
@@ -102,7 +111,15 @@ enum H264SPS {
         }
 
         guard width > 0, height > 0 else { return nil }
-        return (width, height, frameMbsOnly)
+        var core = BitReader(rbsp), signature = [UInt8(profileIdc)], packed = 0, count = 0
+        _ = core.u(coreStart)
+        for _ in coreStart..<r.position {
+            guard let b = core.u(1) else { return nil }
+            packed = (packed << 1) | b; count += 1
+            if count == 8 { signature.append(UInt8(packed)); packed = 0; count = 0 }
+        }
+        if count > 0 { signature.append(UInt8(packed << (8 - count))) }
+        return (width, height, frameMbsOnly, signature)
     }
 
     /// Scan Annex-B for the first SPS (NAL type 7) and PPS (NAL type 8), returned with their 1-byte NAL header.
@@ -133,10 +150,16 @@ enum H264SPS {
         return nil
     }
 
-    /// Scan Annex-B for a coded IDR slice NAL (type 5). #133: a mid-stream live join must open on a true
-    /// IDR, not an open-GOP recovery-point I-slice (type 1) whose references precede the join point; starting
-    /// there renders garbage (green frames) until the next real IDR. Cheap NAL-header walk, no RBSP parse.
-    static func containsIDR(fromAnnexB data: UnsafeBufferPointer<UInt8>) -> Bool {
+    /// AE#627: whether a decoder can start at this access unit. An IDR slice qualifies, and so does a
+    /// picture coded only in I/SI slices behind a recovery point SEI with `recovery_frame_cnt == 0`:
+    /// every picture from it on in output order decodes exactly (H.264 D.2.8), and the leading
+    /// pictures that do not are dropped behind the gate. Some broadcast encoders never send an IDR,
+    /// so on those feeds a gate that required one never opened. A recovery point with a later
+    /// recovery frame (gradual refresh) is not an entry point and stays refused.
+    static func isRandomAccessEntry(fromAnnexB data: UnsafeBufferPointer<UInt8>) -> Bool {
+        var recoversHere = false
+        var sawSlice = false
+        var allIntra = true
         var i = 0
         let n = data.count
         func startCode(at p: Int) -> Int {
@@ -149,10 +172,49 @@ enum H264SPS {
             if sc == 0 { i += 1; continue }
             let start = i + sc
             guard start < n else { break }
-            if (data[start] & 0x1f) == 5 { return true }
-            i = start
+            var j = start
+            while j < n, startCode(at: j) == 0 { j += 1 }
+            switch data[start] & 0x1f {
+            case 5:
+                return true
+            case 1:
+                sawSlice = true
+                // first_mb_in_slice and slice_type sit in the first few bytes.
+                let head = unescape(Array(data[(start + 1)..<min(j, start + 17)]))
+                var r = BitReader(head)
+                guard r.ue() != nil, let sliceType = r.ue() else { return false }
+                if sliceType % 5 != 2 && sliceType % 5 != 4 { allIntra = false }
+            case 6:
+                if recoveryFrameCount(seiRBSP: unescape(Array(data[(start + 1)..<j]))) == 0 {
+                    recoversHere = true
+                }
+            default:
+                break
+            }
+            i = j
         }
-        return false
+        return recoversHere && sawSlice && allIntra
+    }
+
+    /// `recovery_frame_cnt` of the recovery point message in one SEI NAL payload (header stripped), nil if absent.
+    static func recoveryFrameCount(seiRBSP rbsp: [UInt8]) -> Int? {
+        var p = 0
+        func sei() -> Int? {
+            var v = 0
+            while p < rbsp.count, rbsp[p] == 0xff { v += 255; p += 1 }
+            guard p < rbsp.count else { return nil }
+            v += Int(rbsp[p]); p += 1
+            return v
+        }
+        while p < rbsp.count, rbsp[p] != 0x80 {
+            guard let type = sei(), let size = sei(), p + size <= rbsp.count else { return nil }
+            if type == 6 {
+                var r = BitReader(Array(rbsp[p..<(p + size)]))
+                return r.ue()
+            }
+            p += size
+        }
+        return nil
     }
 
     /// Build Annex-B extradata the mov muxer accepts directly; ff_isom_write_avcc sniffs the start code and packs avcC.
@@ -161,7 +223,7 @@ enum H264SPS {
         return sc + sps + sc + pps
     }
 
-    private static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
+    static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
         var out = [UInt8](); out.reserveCapacity(b.count)
         var zeros = 0
         var i = 0
@@ -192,6 +254,7 @@ enum H264SPS {
         private let bytes: [UInt8]
         private var bit = 0
         init(_ b: [UInt8]) { bytes = b }
+        var position: Int { bit }
 
         mutating func u(_ n: Int) -> Int? {
             var v = 0

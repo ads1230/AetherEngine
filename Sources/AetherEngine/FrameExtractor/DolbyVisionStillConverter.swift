@@ -1,6 +1,8 @@
+// Only with the DolbyVisionStillReshaping trait (off by default).
+#if DolbyVisionStillReshaping
 import Foundation
 import CoreGraphics
-import Libavutil
+import AetherLibavutil
 
 /// Converts a decoded Dolby Vision Profile 5 / Profile 10.0 base-layer frame (which is
 /// IPT-PQ-C2, NOT standard YCbCr) into an SDR sRGB image by applying the Dolby Vision
@@ -415,3 +417,4 @@ enum DolbyVisionStillConverter {
         UInt8(min(max(x, 0), 1) * 255.0 + 0.5)
     }
 }
+#endif

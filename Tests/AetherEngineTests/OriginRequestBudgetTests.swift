@@ -15,9 +15,67 @@ struct OriginRequestBudgetTests {
     private let sameOriginRotatedToken = URL(string: "https://cdn.example.com:443/signed/movie.mkv?token=b")!
     private let otherOrigin = URL(string: "https://other.example.com:443/movie.mkv")!
 
-    private func freshBudget() -> OriginRequestBudget {
-        let budget = OriginRequestBudget()
+    private func freshBudget(now: @escaping () -> DispatchTime = { .now() }) -> OriginRequestBudget {
+        let budget = OriginRequestBudget(now: now)
         return budget
+    }
+
+    @Test("network completion returns a lease while its caller still retains it",
+          .timeLimit(.minutes(1)))
+    func completedLeaseUnblocksNextReader() async throws {
+        let budget = freshBudget()
+        budget.setHostLimit(1, for: url)
+        let lease = OriginRequestBudget.Lease(
+            budget.acquire(for: url, label: "probe", timeout: 1), budget: budget)
+        defer { lease.release() }
+        let granted = UnsafeFlag()
+        Thread.detachNewThread {
+            let ticket = budget.acquire(for: url, label: "playback", timeout: 120,
+                                        allowOvercommit: false)
+            granted.set(ticket?.granted == true)
+            budget.release(ticket)
+        }
+        try await waitFor { budget.snapshot(for: url)?.waiting == 1 || granted.value != nil }
+        #expect(granted.value == nil)
+        // The callback can return the slot without waiting for the lower-QoS caller to resume.
+        lease.release()
+        try await waitFor { granted.value != nil }
+        #expect(granted.value == true)
+        try await waitFor { budget.snapshot(for: url)?.inflight == 0 }
+        #expect(budget.snapshot(for: url)?.peakInflight == 1)
+    }
+
+    @Test("racing completion and cancellation return a request lease only once",
+          .timeLimit(.minutes(1)))
+    func leaseReleaseIsIdempotent() async throws {
+        let budget = freshBudget()
+        let lease = OriginRequestBudget.Lease(
+            budget.acquire(for: url, label: "completed", timeout: 1), budget: budget)
+        let other = budget.acquire(for: url, label: "still playing", timeout: 1)
+        defer { budget.release(other) }
+        let done = ProbeTestBox(0)
+        for _ in 0..<16 {
+            Thread.detachNewThread {
+                lease.release()
+                done.update { $0 += 1 }
+            }
+        }
+        try await waitFor { done.value == 16 }
+        #expect(budget.snapshot(for: url)?.inflight == 1,
+                "duplicate release must not consume the other reader's live ticket")
+        lease.release()
+        #expect(budget.snapshot(for: url)?.inflight == 1)
+    }
+
+    @Test("a lease returns an abandoned ticket on deallocation")
+    func abandonedLeaseReturnsSlot() {
+        let budget = freshBudget()
+        var lease: OriginRequestBudget.Lease? = .init(
+            budget.acquire(for: url, label: "abandoned", timeout: 1), budget: budget)
+        #expect(lease != nil)
+        #expect(budget.snapshot(for: url)?.inflight == 1)
+        lease = nil
+        #expect(budget.snapshot(for: url)?.inflight == 0)
     }
 
     @Test("an uncapped origin hands out tickets without waiting and only tallies")
@@ -53,21 +111,9 @@ struct OriginRequestBudgetTests {
         budget.release(a); budget.release(b)
     }
 
-    /// Wait for a condition the budget itself reports, rather than for a duration. A sleep long
-    /// enough to "probably" have parked the waiter is a margin against a derived time bound, and
-    /// the first thing a slower CI machine takes away.
-    private func waitUntil(_ deadlineSeconds: Double = 10,
-                           _ condition: () -> Bool) async -> Bool {
-        let deadline = Date(timeIntervalSinceNow: deadlineSeconds)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(nanoseconds: 2_000_000)
-        }
-        return condition()
-    }
-
-    @Test("a capped origin makes the second request wait for the first to finish")
-    func cappedSerialises() async {
+    @Test("a capped origin makes the second request wait for the first to finish",
+          .timeLimit(.minutes(3)))
+    func cappedSerialises() async throws {
         let budget = freshBudget()
         budget.setHostLimit(1, for: url)
 
@@ -76,27 +122,33 @@ struct OriginRequestBudgetTests {
 
         let secondGranted = UnsafeFlag()
         let secondStarted = UnsafeFlag()
-        DispatchQueue.global().async {
+        // A detached thread, not `DispatchQueue.global().async`: the waiter IS the subject of this
+        // test, so it may not depend on a pool that hands out threads only once one is free. Under
+        // the suite's own load the global pool has kept this block waiting past every deadline the
+        // test ever put on it (30 s, twice on CI), and the failure then reads as a budget defect
+        // that was never measured.
+        Thread.detachNewThread {
             secondStarted.set(true)
-            let second = budget.acquire(for: url, label: "detour", timeout: 20)
+            // 120 s, not 20: the acquire's own wait must not be able to expire before the test's
+            // `.timeLimit`, or `secondGranted` turns from nil into false and the negative
+            // expectation below reports the OPPOSITE of what starvation did.
+            let second = budget.acquire(for: url, label: "detour", timeout: 120)
             secondGranted.set(second?.granted == true)
             budget.release(second)
         }
-        // Waiting for the park without first waiting for the THREAD spends the observation window
-        // on libdispatch. A green run and a run where the block never got a thread then look
-        // identical, and the second one reports a budget defect that was never measured. Seen on
-        // CI: `parked` false with `secondGranted` still nil, i.e. the acquire had not happened.
-        #expect(await waitUntil(30) { secondStarted.value == true },
-                "the waiter never got a thread; nothing about the budget was measured")
-        let parked = await waitUntil { budget.snapshot(for: url)?.waiting == 1 }
-        #expect(parked, "the second acquire must park rather than proceed")
+        // Waiting for the park without first waiting for the thread spends the observation window
+        // on scheduling. A green run and a run where the waiter never ran then look identical.
+        try await waitFor { secondStarted.value == true }
+        // Either outcome ends the wait, so a budget that lets the second request through is still
+        // reported at once, and starvation can only delay this line, never flip what it reads.
+        try await waitFor { budget.snapshot(for: url)?.waiting == 1 || secondGranted.value != nil }
         #expect(secondGranted.value == nil, "the second request must not proceed while the slot is held")
+        #expect(budget.snapshot(for: url)?.waiting == 1, "the second acquire must park rather than proceed")
 
         budget.release(first)
-        let handed = await waitUntil { secondGranted.value == true }
-        #expect(handed, "releasing the slot must hand it to the waiter")
-        _ = await waitUntil { budget.snapshot(for: url)?.inflight == 0 }
-        #expect(budget.snapshot(for: url)?.inflight == 0)
+        try await waitFor { secondGranted.value != nil }
+        #expect(secondGranted.value == true, "releasing the slot must hand it to the waiter")
+        try await waitFor { budget.snapshot(for: url)?.inflight == 0 }
     }
 
     @Test("a waiter that times out proceeds anyway rather than blocking the read forever")
@@ -119,29 +171,31 @@ struct OriginRequestBudgetTests {
                 "a timed-out waiter must not leak its slot")
     }
 
-    @Test("the slot goes to the waiter at the front, not to whoever locks first")
-    func releaseIsFIFO() async {
+    @Test("the slot goes to the waiter at the front, not to whoever locks first",
+          .timeLimit(.minutes(3)))
+    func releaseIsFIFO() async throws {
         let budget = freshBudget()
         budget.setHostLimit(1, for: url)
         let held = budget.acquire(for: url, label: "pump", timeout: 1)
 
         let order = UnsafeOrder()
-        DispatchQueue.global().async {
-            let t = budget.acquire(for: url, label: "detour", timeout: 20)
+        Thread.detachNewThread {
+            let t = budget.acquire(for: url, label: "detour", timeout: 120)
             order.append("detour")
             budget.release(t)
         }
-        let parked = await waitUntil { budget.snapshot(for: url)?.waiting == 1 }
-        #expect(parked, "the detour must be in the queue before the pump gives the slot back")
+        try await waitFor { budget.snapshot(for: url)?.waiting == 1 || order.first != nil }
+        #expect(budget.snapshot(for: url)?.waiting == 1,
+                "the detour must be in the queue before the pump gives the slot back")
 
         // The pump releasing and immediately re-taking must not beat the parked detour: that is
         // exactly the starvation a range boundary every 32 MB would produce.
         budget.release(held)
-        let reacquired = budget.acquire(for: url, label: "pump", timeout: 20)
+        let reacquired = budget.acquire(for: url, label: "pump", timeout: 120)
         order.append("pump")
         budget.release(reacquired)
 
-        _ = await waitUntil { order.first != nil }
+        try await waitFor { order.first != nil }
         #expect(order.first == "detour",
                 "a pump reconnecting at a range boundary must not starve a waiting detour")
     }
@@ -159,6 +213,291 @@ struct OriginRequestBudgetTests {
         #expect(budget.snapshot(for: url)?.refusals == 3)
 
         tickets.forEach { budget.release($0) }
+    }
+
+    @Test("an unrefused origin never arms the request-rate pacer")
+    func unrefusedOriginIsNeverPaced() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+
+        #expect(!budget.isPaced(url))
+        let first = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(first?.granted == true)
+        #expect(budget.snapshot(for: url)?.paced == false)
+        budget.release(first)
+
+        clock.advance(by: 600)
+        let later = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(later?.granted == true, "time alone must not arm an origin that never refused")
+        #expect(budget.snapshot(for: url)?.paced == false)
+        budget.release(later)
+    }
+
+    /// AE#465 round 2. The case the reversed invariant above is actually FOR: at a ceiling of one,
+    /// a paced caller must leave the single slot available, or the rate rule has silently become a
+    /// concurrency outage for every other path against that origin.
+    @Test("a paced caller leaves a single-slot origin's slot available",
+          .timeLimit(.minutes(3)))
+    func pacedCallerLeavesTheSlotFree() async throws {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.setHostLimit(1, for: url)
+        budget.noteRefusal(for: url, status: 429)
+
+        let granted = UnsafeFlag()
+        let started = UnsafeFlag()
+        Thread.detachNewThread {
+            started.set(true)
+            let ticket = budget.acquire(for: self.url, label: "pump", timeout: 120)
+            granted.set(ticket?.granted == true)
+            budget.release(ticket)
+        }
+        try await waitFor { started.value == true }
+
+        try await waitFor { budget.snapshot(for: url)?.paced == true }
+        #expect(budget.snapshot(for: url)?.inflight == 0,
+                "the one slot must stay free while its only caller waits on the rate rule")
+        #expect(granted.value == nil, "the pacer's quiet period has not elapsed yet")
+
+        clock.advance(by: 4)
+        try await waitFor { granted.value != nil }
+        #expect(granted.value == true,
+                "the pacer must hand the caller through once the quiet period is paid")
+        try await waitFor { budget.snapshot(for: url)?.inflight == 0 }
+        #expect(budget.snapshot(for: url)?.inflight == 0, "the granted ticket returns its slot")
+    }
+
+    @Test("isPaced follows the pacer's armed, draining, and disarmed states")
+    func isPacedReportsThePacerLifetime() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+
+        #expect(!budget.isPaced(url))
+        budget.noteRefusal(for: url, status: 429)
+        #expect(budget.isPaced(url), "the first refusal arms pacing inside its quiet period")
+
+        clock.advance(by: 4)
+        for _ in 0..<2 {
+            let ticket = budget.tryAcquire(for: url, label: "pump")
+            #expect(ticket?.granted == true)
+            budget.release(ticket)
+        }
+        #expect(budget.isPaced(url),
+                "an empty bucket remains paced after the quiet period while tokens refill")
+
+        clock.advance(by: 60.1)
+        #expect(!budget.isPaced(url), "sixty seconds without a refusal disarms pacing")
+    }
+
+    @Test("isPaced answers for a relay URL through the redirect chain head")
+    func isPacedCrossesTheRedirectChain() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        let relay = URL(string: "https://relay.example.com/link/movie")!
+        let cdn = URL(string: "https://edge.example.net/signed/movie?token=one")!
+
+        budget.noteRedirect(from: relay, to: cdn)
+        budget.noteRefusal(for: cdn, status: 429)
+
+        #expect(budget.isPaced(cdn))
+        #expect(budget.isPaced(relay),
+                "the host-loaded relay must report pacing learned from its folded CDN")
+    }
+
+    @Test("the first refusal arms a two-second quiet period with an empty bucket")
+    func firstRefusalArmsThePacer() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+
+        budget.noteRefusal(for: url, status: 429)
+        #expect(budget.snapshot(for: url)?.paced == true)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil)
+
+        clock.advance(by: 1.99)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil,
+                "the quiet period, not token refill, is the first gate")
+        clock.advance(by: 0.02)
+        let ticket = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(ticket?.granted == true)
+        budget.release(ticket)
+    }
+
+    @Test("Retry-After overrides the learned quiet period")
+    func retryAfterOverridesQuietPeriod() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+
+        budget.noteRefusal(for: url, status: 429, retryAfter: 6)
+        clock.advance(by: 5.99)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil)
+        clock.advance(by: 0.02)
+        let ticket = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(ticket?.granted == true)
+        budget.release(ticket)
+    }
+
+    @Test("refusals in one streak double the quiet period and cap it at fifteen seconds")
+    func refusalQuietPeriodDoublesAndCaps() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+
+        budget.noteRefusal(for: url, status: 429)
+        budget.noteRefusal(for: url, status: 429)
+        clock.advance(by: 3.99)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil)
+        clock.advance(by: 0.02)
+        let afterFour = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(afterFour?.granted == true, "the second refusal in the streak waits four seconds")
+        budget.release(afterFour)
+
+        budget.noteRefusal(for: url, status: 429)
+        budget.noteRefusal(for: url, status: 429)
+        clock.advance(by: 14.99)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil)
+        clock.advance(by: 0.02)
+        let afterCap = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(afterCap?.granted == true, "the fourth refusal caps at fifteen seconds, not sixteen")
+        budget.release(afterCap)
+    }
+
+    @Test("an acquire inside the quiet period waits and proceeds when the injected clock advances",
+          .timeLimit(.minutes(3)))
+    func acquireWaitsForThePacer() async throws {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.noteRefusal(for: url, status: 429)
+
+        let started = UnsafeFlag()
+        let granted = UnsafeFlag()
+        Thread.detachNewThread {
+            started.set(true)
+            // Generous on purpose: the injected clock decides when this is released, so a real
+            // budget short enough for a loaded machine to spend first would make the wall clock the
+            // subject instead.
+            let ticket = budget.acquire(for: self.url, label: "pump", timeout: 120)
+            granted.set(ticket?.granted == true)
+            budget.release(ticket)
+        }
+
+        try await waitFor { started.value == true }
+        // AE#465 round 2 reverses what this used to assert. Owning the slot while the pacer holds
+        // you turns a rate rule into a concurrency rule: on a single-slot origin one paced request
+        // then parks every other path for the whole quiet period, and a suite of readers doing that
+        // blocked enough threads that unrelated CI tests could not get one. A token is consumed,
+        // not held, so nothing is owed to the books until it is granted.
+        try await waitFor { budget.snapshot(for: url)?.paced == true }
+        #expect(budget.snapshot(for: url)?.inflight == 0,
+                "a request waiting on the rate rule must not be occupying a concurrency slot")
+        #expect(granted.value == nil, "the request must remain parked inside the quiet period")
+
+        clock.advance(by: 2)
+        try await waitFor { granted.value != nil }
+        #expect(granted.value == true,
+                "advancing the injected clock must release the request without a two-second sleep")
+    }
+
+    @Test("a paced acquire that exhausts its caller budget proceeds ungranted")
+    func pacedAcquireRespectsTimeout() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.noteRefusal(for: url, status: 429)
+
+        let ticket = budget.acquire(for: url, label: "pump", timeout: 0)
+        #expect(ticket?.granted == false,
+                "request pacing is a throttle, not a correctness barrier")
+        #expect(budget.snapshot(for: url)?.inflight == 1,
+                "an over-budget request still counts as present on the link")
+        budget.release(ticket)
+        #expect(budget.snapshot(for: url)?.inflight == 0)
+    }
+
+    @Test("tokens refill at one every two seconds and cap at two")
+    func tokensRefillAndCap() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.noteRefusal(for: url, status: 429)
+        clock.advance(by: 4)
+
+        for _ in 0..<2 {
+            let ticket = budget.tryAcquire(for: url, label: "tail prefetch")
+            #expect(ticket?.granted == true)
+            budget.release(ticket)
+        }
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil,
+                "the burst capacity is two")
+
+        clock.advance(by: 1.99)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil,
+                "less than two seconds does not refill one token")
+        clock.advance(by: 0.02)
+        let refilled = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(refilled?.granted == true, "two seconds refill one token")
+        budget.release(refilled)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil)
+
+        clock.advance(by: 10)
+        for _ in 0..<2 {
+            let ticket = budget.tryAcquire(for: url, label: "tail prefetch")
+            #expect(ticket?.granted == true)
+            budget.release(ticket)
+        }
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil,
+                "a long refill must still cap the bucket at two")
+    }
+
+    @Test("twenty clean grants do not disarm pacing before sixty quiet seconds")
+    func cleanGrantsDoNotDisarmPacing() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.noteRefusal(for: url, status: 429)
+        clock.advance(by: 2)
+
+        for grant in 0..<20 {
+            let ticket = budget.tryAcquire(for: url, label: "tail prefetch")
+            #expect(ticket?.granted == true)
+            budget.release(ticket)
+            if grant < 19 {
+                clock.advance(by: 2)
+            }
+        }
+        #expect(budget.isPaced(url), "clean grants cannot disarm a recently refused warm link")
+        #expect(budget.snapshot(for: url)?.paced == true)
+        #expect(budget.limit(for: url) == 1,
+                "clean grants must not undo upstream's learned concurrency limit")
+
+        clock.advance(by: 20.1)
+        #expect(!budget.isPaced(url), "the sixty-second quiet rule still disarms pacing")
+    }
+
+    @Test("sixty seconds without a refusal disarms pacing")
+    func quietOriginDisarmsPacing() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.noteRefusal(for: url, status: 429)
+
+        clock.advance(by: 59.9)
+        #expect(budget.snapshot(for: url)?.paced == true)
+        clock.advance(by: 0.2)
+        #expect(budget.snapshot(for: url)?.paced == false)
+        let ticket = budget.tryAcquire(for: url, label: "tail prefetch")
+        #expect(ticket?.granted == true, "the bucket is irrelevant after the quiet disarm")
+        budget.release(ticket)
+    }
+
+    @Test("a host concurrency limit still wins while request pacing is armed")
+    func hostLimitStillWinsWithPacing() {
+        let clock = ManualDispatchClock()
+        let budget = freshBudget(now: clock.now)
+        budget.setHostLimit(1, for: url)
+        budget.noteRefusal(for: url, status: 429)
+        clock.advance(by: 2)
+
+        let held = budget.tryAcquire(for: url, label: "pump")
+        #expect(held?.granted == true)
+        #expect(budget.tryAcquire(for: url, label: "tail prefetch") == nil,
+                "available tokens do not override a full host concurrency budget")
+        #expect(budget.limit(for: url) == 1)
+        budget.release(held)
     }
 
     @Test("a host limit wins over anything learned, in both directions")
@@ -254,6 +593,97 @@ struct OriginRequestBudgetTests {
         #expect(!budget.refusedRecently(fileURL, within: 30))
         budget.release(nil)
     }
+
+    // MARK: - Dropped targets and the refusal shape (#377 round 5)
+
+    /// The books answer for a chain, so a target dropped while asking one end is known from the
+    /// other. Which matters because the two ends have different lifetimes: the source URL is what
+    /// the host loaded and what every later reader is built from, the target is a lease.
+    @Test("a dropped target is known from the source URL, and folds with the chain")
+    func droppedTargetIsChainScoped() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/file.mkv?sig=a")!
+        budget.noteRedirect(from: url, to: target)
+        budget.noteTargetDropped(target, from: url)
+
+        let targetKey = OriginRequestBudget.originKey(for: target)!
+        #expect(budget.droppedTargets(for: url) == [targetKey])
+        #expect(budget.droppedTargets(for: target) == [targetKey],
+                "either end of one chain has to give the same answer")
+        #expect(budget.droppedTargets(for: otherOrigin).isEmpty,
+                "another origin's refusals are not this one's history")
+    }
+
+    /// A second target dropped in a later window does not evict the first. One slot described one
+    /// window and the reporter's session refused in three.
+    @Test("every dropped target of a chain is kept, not just the last")
+    func everyDroppedTargetIsKept() {
+        let budget = freshBudget()
+        let first = URL(string: "https://nexus-042.cdn.example.st/f.mkv")!
+        let second = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        budget.noteRedirect(from: url, to: first)
+        budget.noteTargetDropped(first, from: url)
+        budget.noteRedirect(from: url, to: second)
+        budget.noteTargetDropped(second, from: url)
+
+        #expect(budget.droppedTargets(for: url).count == 2)
+    }
+
+    /// #377 round 5: peak concurrency is the one fact that can refute the reading the status code
+    /// invites. An origin that refused while we never had more than one request open did not refuse
+    /// us for asking too much at once, whatever a 429 suggests, and the fix for the two cases is
+    /// different.
+    @Test("the give-up note reports the books, and names peak 1 as not a concurrency ceiling")
+    func refusalShapeNoteSeparatesConcurrencyFromARefusingTarget() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        budget.noteRedirect(from: url, to: target)
+
+        #expect(budget.refusalShapeNote(for: url).isEmpty,
+                "an origin that never refused has nothing to say at a give-up")
+
+        let ticket = budget.acquire(for: url, label: "pump", timeout: 0.1)
+        budget.noteRefusal(for: target, status: 429)
+        budget.release(ticket)
+        budget.noteTargetDropped(target, from: url)
+
+        let note = budget.refusalShapeNote(for: url)
+        #expect(note.contains("peak 1 in flight"), Comment(rawValue: note))
+        #expect(note.contains("1 refusals") || note.contains("1 refusal"), Comment(rawValue: note))
+        #expect(note.contains("nexus-179.cdn.example.st"), Comment(rawValue: note))
+        #expect(note.contains("cannot exceed a concurrency ceiling"), Comment(rawValue: note))
+    }
+
+    /// The other half of the same line: with two requests seen at once, a refusal MIGHT be about
+    /// concurrency, and the note must not claim otherwise.
+    @Test("a peak above one withholds the concurrency verdict")
+    func refusalShapeNoteIsSilentOnConcurrencyAbovePeakOne() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        budget.noteRedirect(from: url, to: target)
+        let a = budget.acquire(for: url, label: "pump", timeout: 0.1)
+        let b = budget.acquire(for: url, label: "detour", timeout: 0.1)
+        budget.noteRefusal(for: target, status: 429)
+        budget.noteTargetDropped(target, from: url)
+        budget.release(a); budget.release(b)
+
+        let note = budget.refusalShapeNote(for: url)
+        #expect(note.contains("peak 2 in flight"), Comment(rawValue: note))
+        #expect(!note.contains("cannot exceed a concurrency ceiling"), Comment(rawValue: note))
+    }
+
+    /// A chain fold merges two sets of books, and the dropped targets are books.
+    @Test("folding a chain keeps both ends' dropped targets")
+    func foldMergesDroppedTargets() {
+        let budget = freshBudget()
+        let target = URL(string: "https://nexus-179.cdn.example.st/f.mkv")!
+        let stale = URL(string: "https://nexus-042.cdn.example.st/f.mkv")!
+        budget.noteTargetDropped(stale, from: target)
+        budget.noteRedirect(from: url, to: target)
+
+        #expect(budget.droppedTargets(for: url).contains(OriginRequestBudget.originKey(for: stale)!),
+                "the target's history joins the chain it is folded into")
+    }
 }
 
 /// Minimal cross-thread carriers; the suite runs actual concurrency, so the expectations need a
@@ -270,4 +700,22 @@ private final class UnsafeOrder: @unchecked Sendable {
     private var items: [String] = []
     var first: String? { lock.lock(); defer { lock.unlock() }; return items.first }
     func append(_ s: String) { lock.lock(); items.append(s); lock.unlock() }
+}
+
+/// Monotonic test clock for the refusal pacer. The production wait polls this clock, so advancing
+/// it releases a paced request without making the suite spend the CDN's two-to-fifteen-second
+/// quiet periods on wall time.
+private final class ManualDispatchClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nanoseconds: UInt64 = 1_000_000_000
+
+    func now() -> DispatchTime {
+        lock.lock(); defer { lock.unlock() }
+        return DispatchTime(uptimeNanoseconds: nanoseconds)
+    }
+
+    func advance(by seconds: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        nanoseconds += UInt64((seconds * 1_000_000_000).rounded())
+    }
 }

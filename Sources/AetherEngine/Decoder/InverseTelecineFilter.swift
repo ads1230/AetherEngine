@@ -1,6 +1,6 @@
 import Foundation
-import Libavfilter
-import Libavutil
+import AetherLibavfilter
+import AetherLibavutil
 
 /// Inverse telecine for the software-decode path: NTSC transfers of 24fps
 /// film (29.97fps with baked 3:2 pulldown) repeat every fifth frame, a

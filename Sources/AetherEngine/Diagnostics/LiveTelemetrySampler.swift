@@ -58,8 +58,16 @@ struct NativeAVFReadings: Sendable {
     /// the tail the playhead jumps ahead of loaded media, so the clamped `forwardBufferSeconds` (>= 0)
     /// hides that the final segment has not arrived; the decision needs the true loaded end vs duration.
     var loadedRangeEndSeconds: Double? = nil
-    /// Sum over all access-log events, for the [LagDiag] tick-over-tick drop delta.
-    var droppedFramesLifetimeSum: Int = 0
+    /// AE#520 round 2: how long this consumer can keep playing without being handed anything else, which
+    /// is the range the playhead is INSIDE and not the last one loaded. `forwardBufferSeconds` above
+    /// reads the last range's end, so on an item with a hole in front of the playhead it names content
+    /// the consumer cannot reach without stalling first. A decision that spends this depth needs the
+    /// half it can actually walk; nil when no loaded range contains the playhead at all.
+    var contiguousForwardBufferSeconds: Double? = nil
+    /// The current variant's declared BANDWIDTH and AVERAGE-BANDWIDTH, in bits per second, from the
+    /// latest access-log entry. The log reports an undeclared value as negative.
+    var indicatedBitrate: Double = -1
+    var indicatedAverageBitrate: Double = -1
     var currentTimeSeconds: Double = .nan
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     var rate: Float = 0
@@ -108,12 +116,21 @@ final class LiveTelemetrySampler {
     private var lastDemuxerBytes: Int64 = 0
     private var lastBridgeBytes: Int64 = 0
     private var lastFramesEnqueued: Int = 0
-    private var sessionStartTime: Date?
-    private var sessionStartBytes: Int64 = 0
+
+    /// AE#514: both bitrate fields, metered over what the playhead crossed. Readable so a test can pin
+    /// that the tick feeds it, not only that the meter is right.
+    private(set) var playedMeter = PlayedBitrateMeter()
+
+    /// The ledger the meter was last advanced against. A different one is a different session, whose
+    /// playhead and bytes have nothing to do with the old meter's.
+    private var meterLedger: ObjectIdentifier?
+
+    /// Timestamp of the previous tick: the wall time the playhead had to cover its step in.
+    private var lastTickTime: Date?
 
     /// [LagDiag] tick-over-tick state (#93 post-recovery lag diagnosis).
     private var lagLastClock: Double?
-    private var lagLastDroppedSum: Int = 0
+    private var lagLastDroppedSum: Int?
 
     /// #169 tail-park end-of-media synthesis state.
     private var eomParkFrozenTicks: Int = 0
@@ -141,10 +158,11 @@ final class LiveTelemetrySampler {
         lastDemuxerBytes = engine?.demuxerBytesFetched ?? 0
         lastBridgeBytes = engine?.audioBridgeOutputBytesLifetime ?? 0
         lastFramesEnqueued = 0
-        sessionStartTime = Date()
-        sessionStartBytes = 0
+        playedMeter = PlayedBitrateMeter()
+        meterLedger = nil
+        lastTickTime = nil
         lagLastClock = nil
-        lagLastDroppedSum = 0
+        lagLastDroppedSum = nil
         eomParkFrozenTicks = 0
         eomParkLastPlayhead = nil
         didSynthesizeEomPark = false
@@ -180,38 +198,78 @@ final class LiveTelemetrySampler {
         return Double(windowBytes) * 8.0 / Double(activeSeconds) / 1_000_000.0
     }
 
+    /// Which cumulative counter the two bitrate fields are metered from.
+    enum BitrateCounter: Equatable {
+        /// Bytes the engine's demuxer pulled from the source (loopback and software).
+        case demuxer
+        /// The bitrate the playing variant declares, from AVPlayer's access log. The remote-HLS bypass has no
+        /// demuxer, and what AVPlayer transferred is not the stream's rate: a buffer filling after a start or
+        /// a seek pulls at link speed (22.6 Mbps measured for a 3.7 Mbps transcode). The transfer stays in the
+        /// network fields.
+        case declaredVariant
+    }
+
+    nonisolated static func bitrateCounter(for route: VideoRoute) -> BitrateCounter {
+        route == .remoteBypass ? .declaredVariant : .demuxer
+    }
+
+    /// Both bitrate fields from the access log's declarations, in Mbps: instant is BANDWIDTH, average is
+    /// AVERAGE-BANDWIDTH, falling back to BANDWIDTH where the master omits it. Undeclared reads nil.
+    nonisolated static func declaredBitrates(indicated: Double, indicatedAverage: Double)
+        -> (instant: Double?, average: Double?) {
+        func mbps(_ bps: Double) -> Double? { bps.isFinite && bps > 0 ? bps / 1_000_000.0 : nil }
+        let instant = mbps(indicated)
+        return (instant, mbps(indicatedAverage) ?? instant)
+    }
+
+    /// Whether the native branch has the loopback pipeline behind it. On the bypass the producer's A/V gap
+    /// does not exist (its getter reads 0, which would publish as a measured zero), and the #169 tail-park
+    /// synthesis stays with the route whose EXTINF overshoot it was built for.
+    nonisolated static func readsLoopbackPipeline(_ route: VideoRoute) -> Bool {
+        route != .remoteBypass
+    }
+
+    /// AE#514: where the playhead stands on the axis the played-media ledger is keyed on, the source
+    /// axis the pumps read packets on. Native folds AVPlayer's clock back with the producer's shift
+    /// (`source_pts - playlistShiftSeconds`) rather than reading `sourceTime`, which publishes the item
+    /// axis on a sequential origin (#368). nil where there is no ledger-fed pipeline to read it off.
+    nonisolated static func ledgerPlayhead(backend: PlaybackBackend, nativeClock: Double?, playlistShift: Double,
+                               softwareSourceClock: Double?) -> Double? {
+        switch backend {
+        case .native:
+            guard let nativeClock, nativeClock.isFinite else { return nil }
+            return nativeClock + playlistShift
+        case .software:
+            return softwareSourceClock
+        case .aether, .none, .audio:
+            return nil
+        }
+    }
+
     private func tick() async {
         guard let engine = engine else { return }
 
-        // Instant + average bitrate from demuxer byte counters (both native and SW paths)
+        let tickTime = Date()
+        let wallSeconds = lastTickTime.map { tickTime.timeIntervalSince($0) } ?? 0
+        lastTickTime = tickTime
+
+        let route = engine.videoRoute
+
+        // What the reader pulled from the source. Transfer, not media rate: it feeds the network fields
+        // and [LagDiag], never the bitrate fields (AE#514, see `playedMeter`).
         let demuxerBytes = engine.demuxerBytesFetched
         let bytesThisTick = max(0, demuxerBytes - lastDemuxerBytes)
         lastDemuxerBytes = demuxerBytes
-        if sessionStartBytes == 0 { sessionStartBytes = demuxerBytes }
         byteWindow.push(bytesThisTick)
 
-        let instantBitrateMbps: Double?
-        if byteWindow.count >= 2 {
-            let totalBytes = byteWindow.sum
-            let seconds = Double(byteWindow.count)
-            instantBitrateMbps = Double(totalBytes) * 8.0 / seconds / 1_000_000.0
-        } else {
-            instantBitrateMbps = nil
-        }
+        let transferMbps: Double? = byteWindow.count >= 2
+            ? Double(byteWindow.sum) * 8.0 / Double(byteWindow.count) / 1_000_000.0
+            : nil
 
         let observedTransferMbps = Self.observedTransferMbps(
             windowBytes: byteWindow.sum,
             activeSeconds: byteWindow.activeCount,
             samples: byteWindow.count)
-
-        let averageBitrateMbps: Double?
-        if let start = sessionStartTime {
-            let elapsed = max(0.5, Date().timeIntervalSince(start))
-            let lifetimeBytes = max(0, demuxerBytes - sessionStartBytes)
-            averageBitrateMbps = Double(lifetimeBytes) * 8.0 / elapsed / 1_000_000.0
-        } else {
-            averageBitrateMbps = nil
-        }
 
         // Live audio-bridge output bitrate from the bridge's cumulative encoded-byte counter. 0 on the
         // stream-copy / AVPlayer-native / video-only paths (no bridge), which surfaces as nil.
@@ -245,25 +303,43 @@ final class LiveTelemetrySampler {
             observedFps = nil
             displayCushionSeconds = nil
             accumulatedFrameDelaySeconds = nil
-            avSyncGapMs = engine.lastAVGapMs  // HLSSegmentProducer audio-gate-open vs video-gate-open (native path only)
+            // HLSSegmentProducer audio-gate-open vs video-gate-open, loopback only.
+            avSyncGapMs = Self.readsLoopbackPipeline(route) ? engine.lastAVGapMs : nil
             if let player = engine.currentAVPlayer, let item = player.currentItem {
-                let readings = await readNativeOffMain(player: player, item: item)
+                var readings = await readNativeOffMain(player: player, item: item)
                 // stop() may have cancelled this tick, or a reload seam may have swapped the
                 // player/item, while the read was in flight; publishing now would leak a stale
                 // snapshot and yield-gate tick into the current session.
                 guard !Task.isCancelled,
                       engine.currentAVPlayer === player,
                       player.currentItem === item else { return }
+                engine.nativeHost?.recordItemCounters(
+                    ItemLogCounters(transferredBytes: readings.networkTransferredBytes,
+                                    droppedFrames: readings.droppedFrameCount), item: item)
+                // AE#443: the read above covers this item; the host carries what the items before it
+                // transferred. Read after the guard, so the two halves describe the same swap state.
+                readings.networkTransferredBytes = Self.foldRetired(
+                    readings.networkTransferredBytes, retired: engine.nativeHost?.retiredItemTransferredBytes ?? 0)
+                readings.droppedFrameCount = Self.foldRetired(
+                    readings.droppedFrameCount, retired: engine.nativeHost?.retiredItemDroppedFrames ?? 0)
                 nativeReadings = readings
                 droppedFrameCount = readings.droppedFrameCount
                 networkThroughputMbps = readings.networkThroughputMbps
                 networkTransferredBytes = readings.networkTransferredBytes
                 forwardBufferSeconds = readings.forwardBufferSeconds
+                // AE#520 round 2: the outage close spends the depth this consumer can still walk, and
+                // it is decided on a playlist-build thread that must not hop the main actor to ask.
+                engine.consumerContiguousBufferMirror.set(readings.contiguousForwardBufferSeconds)
             } else {
-                droppedFrameCount = nil
+                // AE#443: an item swap has a gap where the host holds no current item, and reporting
+                // nothing through it reads as "the counter is gone" rather than "nothing new since".
+                droppedFrameCount = Self.foldRetired(nil, retired: engine.nativeHost?.retiredItemDroppedFrames ?? 0)
                 networkThroughputMbps = nil
-                networkTransferredBytes = nil
+                networkTransferredBytes = Self.foldRetired(nil, retired: engine.nativeHost?.retiredItemTransferredBytes ?? 0)
                 forwardBufferSeconds = nil
+                // Between items there is no consumer to read a depth off, and reporting the last one
+                // would hand the close a figure about an item that is gone.
+                engine.consumerContiguousBufferMirror.set(nil)
             }
 
         case .software:
@@ -311,15 +387,48 @@ final class LiveTelemetrySampler {
             accumulatedFrameDelaySeconds = nil
         }
 
+        // AE#514: the bitrate fields are the media the playhead crossed, never the transfer.
+        var instantBitrateMbps: Double?
+        var averageBitrateMbps: Double?
+        if let ledger = engine.playedMediaLedger {
+            let identity = ObjectIdentifier(ledger)
+            if meterLedger != identity {
+                meterLedger = identity
+                playedMeter = PlayedBitrateMeter()
+            }
+            playedMeter.advance(
+                to: Self.ledgerPlayhead(
+                    backend: engine.playbackBackend,
+                    nativeClock: nativeReadings?.currentTimeSeconds,
+                    playlistShift: engine.playlistShiftSeconds,
+                    softwareSourceClock: engine.softwareHost?.sourceClockSeconds),
+                wallSeconds: wallSeconds,
+                ledger: ledger)
+            instantBitrateMbps = playedMeter.instantMbps
+            averageBitrateMbps = playedMeter.averageMbps
+        }
+
+        // Remote-HLS bypass: no demuxer, so both rates are what the playing variant declares.
+        if Self.bitrateCounter(for: route) == .declaredVariant {
+            let declared = Self.declaredBitrates(
+                indicated: nativeReadings?.indicatedBitrate ?? -1,
+                indicatedAverage: nativeReadings?.indicatedAverageBitrate ?? -1)
+            instantBitrateMbps = declared.instant
+            averageBitrateMbps = declared.average
+        }
+
         // Feed the extractor yield gate (#93 startup): nil on non-native paths keeps the
         // gate conservative there, but those paths have no active session to gate anyway.
         engine.extractorYieldState.setForwardBuffer(forwardBufferSeconds)
 
         if let readings = nativeReadings {
-            emitLagDiag(engine: engine, readings: readings, netMbps: instantBitrateMbps)
-            evaluateEndOfMediaPark(engine: engine, readings: readings)
+            emitLagDiag(engine: engine, readings: readings, netMbps: transferMbps)
+            if Self.readsLoopbackPipeline(route) {
+                evaluateEndOfMediaPark(engine: engine, readings: readings)
+            }
         }
 
+        let softwareCache = engine.softwarePacketCacheSnapshot
         let snapshot = LiveTelemetry(
             instantBitrateMbps: instantBitrateMbps,
             averageBitrateMbps: averageBitrateMbps,
@@ -331,6 +440,9 @@ final class LiveTelemetrySampler {
             readerWindowAheadBytes: readerWindowAheadBytes,
             accumulatedFrameDelaySeconds: accumulatedFrameDelaySeconds,
             cachedBytes: engine.cachedBytes,
+            softwareCacheSeekHits: softwareCache?.cacheSeekHits,
+            softwareCacheSeekMisses: softwareCache?.cacheSeekMisses,
+            softwareCacheSourceEpoch: softwareCache?.sourceEpoch,
             networkThroughputMbps: networkThroughputMbps,
             networkTransferredBytes: networkTransferredBytes,
             avSyncGapMs: avSyncGapMs,
@@ -355,8 +467,8 @@ final class LiveTelemetrySampler {
         let dclk = (clock.isFinite && lagLastClock != nil) ? clock - lagLastClock! : nil
         if clock.isFinite { lagLastClock = clock }
 
-        let droppedSum = readings.droppedFramesLifetimeSum
-        let dDrop = droppedSum - lagLastDroppedSum
+        let droppedSum = readings.droppedFrameCount
+        let dDrop = droppedSum.flatMap { total in lagLastDroppedSum.map { total - $0 } }
         lagLastDroppedSum = droppedSum
 
         let tcs: String
@@ -380,7 +492,7 @@ final class LiveTelemetrySampler {
             + "tcs=\(tcs) rate=\(fmt2(Double(readings.rate))) wait=\(readings.reasonForWaitingToPlay ?? "-") "
             + "fwd=\(readings.forwardBufferSeconds.map { String(format: "%.1f", $0) } ?? "-") "
             + "keepUp=\(readings.isPlaybackLikelyToKeepUp ? "y" : "n") empty=\(readings.isPlaybackBufferEmpty ? "y" : "n") "
-            + "drop=\(droppedSum)+\(dDrop) stall=\(engine.nativeHost?.stallCount ?? 0) "
+            + "drop=\(droppedSum.map(String.init) ?? "-")+\(dDrop.map(String.init) ?? "-") videoFrames=unavailable stall=\(engine.nativeHost?.stallCount ?? 0) "
             + "ready=\((engine.nativeHost?.playerLayer.isReadyForDisplay ?? false) ? "y" : "n") "
             + "thermal=\(thermal) net=\(netMbps.map { String(format: "%.1f", $0) } ?? "-") "
             + "restarts=\(engine.producerRestartCount)",
@@ -443,22 +555,52 @@ final class LiveTelemetrySampler {
         }
     }
 
+    /// AE#443: fold a per-entry access-log counter into the session total a reader takes it for.
+    ///
+    /// `AVPlayerItemAccessLogEvent` counts within its own entry, and AVFoundation opens a new one every
+    /// time the playback session changes under it. Measured on the live loopback harness across a rewind
+    /// and a return to the edge, one origin connection for the whole run and no producer restart at all:
+    /// `rx` went 3.4 MB -> 2.2 MB and `drop` 44 -> 0 while the session played on. A number that falls in
+    /// the middle of a healthy session invites exactly one reading, that something under it was replaced,
+    /// and the reporter of #443 spent two rounds on that reading before the logs refused it.
+    ///
+    /// Entries that report the field as unavailable (negative) are skipped rather than clamped, and the
+    /// result is nil when none of them carried it, so "not measurable" stays distinguishable from zero.
+    nonisolated static func sessionTotal<T: BinaryInteger>(perEntry values: [T]) -> T? {
+        let known = values.filter { $0 >= 0 }
+        return known.isEmpty ? nil : known.reduce(0, +)
+    }
+
+    /// AE#443: adds what the session's retired items carried to what the current one reports.
+    ///
+    /// nil + nothing retired stays nil, because "this path cannot report it" is not zero. nil with a
+    /// retired total is the swap gap, and the honest reading there is the total so far, not silence.
+    nonisolated static func foldRetired<T: BinaryInteger>(_ current: T?, retired: T) -> T? {
+        guard let current else { return retired > 0 ? retired : nil }
+        return current + retired
+    }
+
     /// The real batch, run on `readQueue`: one accessLog() shared by the snapshot fields and the
     /// LagDiag lifetime drop sum, one currentTime() shared by the forward-buffer math and the
     /// LagDiag clock (previously two of each per tick, all on the main actor).
     private nonisolated static func batchReadNativeAVF(player: AVPlayer, item: AVPlayerItem) -> NativeAVFReadings {
         var readings = NativeAVFReadings()
         let events = item.accessLog()?.events
+        // The rate is a `.last` read on purpose: it describes the link right now.
         if let event = events?.last {
-            readings.droppedFrameCount = event.numberOfDroppedVideoFrames >= 0
-                ? event.numberOfDroppedVideoFrames : nil
             let observed = event.observedBitrate
             readings.networkThroughputMbps = observed.isFinite && observed > 0
                 ? observed / 1_000_000.0 : nil
-            readings.networkTransferredBytes = event.numberOfBytesTransferred >= 0
-                ? Int64(event.numberOfBytesTransferred) : nil
+            readings.indicatedBitrate = event.indicatedBitrate
+            readings.indicatedAverageBitrate = event.indicatedAverageBitrate
         }
-        readings.droppedFramesLifetimeSum = events?.reduce(0) { $0 + max(0, $1.numberOfDroppedVideoFrames) } ?? 0
+        // AE#443: the counters are not. They are totals PER ENTRY, and AVFoundation opens a new entry
+        // whenever the playback session changes under it, so reading `.last` publishes a number that
+        // falls BACK mid-session, with nothing in the line to say it did.
+        if let events {
+            readings.networkTransferredBytes = Self.sessionTotal(perEntry: events.map(\.numberOfBytesTransferred))
+            readings.droppedFrameCount = Self.sessionTotal(perEntry: events.map(\.numberOfDroppedVideoFrames))
+        }
 
         let now = player.currentTime().seconds
         readings.currentTimeSeconds = now
@@ -469,6 +611,16 @@ final class LiveTelemetrySampler {
                 if now.isFinite {
                     readings.forwardBufferSeconds = max(0, end - now)
                 }
+            }
+        }
+        if now.isFinite {
+            for value in item.loadedTimeRanges {
+                let range = value.timeRangeValue
+                let start = range.start.seconds
+                let end = CMTimeGetSeconds(CMTimeAdd(range.start, range.duration))
+                guard start.isFinite, end.isFinite, start <= now, end > now else { continue }
+                readings.contiguousForwardBufferSeconds = end - now
+                break
             }
         }
 

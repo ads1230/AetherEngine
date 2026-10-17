@@ -29,6 +29,10 @@ public struct DiscInspection: Sendable {
         public let id: Int
         public let durationSeconds: Double
         public let chapterStartsSeconds: [Double]
+        /// Track languages the disc's navigation data declares for this title, keyed by the stream id
+        /// the demuxer sees (MPEG-TS PID on Blu-ray, MPEG-PS stream / substream id on DVD). Empty when
+        /// the disc declares none, which is what makes language-based track selection impossible (#527).
+        public let streamLanguages: [Int: String]
     }
 
     public var kind: Kind = .notADisc
@@ -115,6 +119,13 @@ enum DiscInspector {
                     } else {
                         kind = .udfNoTitle
                     }
+                } else if let videoTS = root.first(where: { $0.isDir && $0.name.uppercased() == "VIDEO_TS" }) {
+                    // A DVD-Video image with no ISO9660 bridge, as `DiscReader.wrapUDFDVD` reads it.
+                    let names = ((try? udf.list(path: [videoTS.name])) ?? []).filter { !$0.isDir }.map(\.name)
+                    d.dvdVOBFiles = names
+                    let groups = DVDTitleSelector.enumerateTitleVOBGroups(
+                        names.map { DiscFile(name: $0, startSector: 0, length: 1) })
+                    kind = groups.isEmpty ? .udfNoBDMV : .dvdVideo
                 } else {
                     kind = .udfNoBDMV
                 }
@@ -140,7 +151,8 @@ enum DiscInspector {
                 DiscInspection.TitleSummary(
                     id: t.id,
                     durationSeconds: Double(t.durationTicks) / bdTickRate,
-                    chapterStartsSeconds: t.chapters.map { Double($0.startTicks) / bdTickRate }
+                    chapterStartsSeconds: t.chapters.map { Double($0.startTicks) / bdTickRate },
+                    streamLanguages: t.streamLanguages
                 )
             }
         }

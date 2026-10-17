@@ -60,10 +60,15 @@ struct Issue260FrameTimeAxisTests {
         let frames = collector.snapshot()
         try #require(!frames.isEmpty, "no frame times emitted")
 
-        // Vacuum guard: with a zero shift the two axes coincide and the witness proves nothing.
-        let shift = engine.playlistShiftSeconds
+        // Vacuum guard: with a zero separation the two axes coincide and the witness proves nothing.
+        // AE#418 round 5: read it off the PAIR, not off `playlistShiftSeconds`. Since 6.56.6 the
+        // published axis states where AVPlayer PLACES the segment (the presented offset), while the
+        // pair here is what the muxer wrote; on a pinned gate those were one number and this guard
+        // read the wrong one the moment they parted.
+        let deltas = frames.map { CMTimeGetSeconds($0.source) - CMTimeGetSeconds($0.item) }
+        let shift = try #require(deltas.first)
         try #require(abs(shift) > 0.001,
-                     "producer shift is 0 on this clip; the axis witness would be vacuous")
+                     "source and item coincide on this clip; the axis witness would be vacuous")
 
         for frame in frames {
             let delta = CMTimeGetSeconds(frame.source) - CMTimeGetSeconds(frame.item)
@@ -112,7 +117,7 @@ struct Issue260FrameTimeAxisTests {
           .enabled(if: fixtureExists("restart-witness-av.mp4"),
                    "run Scripts/fetch-fixtures.sh to generate the witness clip"),
           .timeLimit(.minutes(2)))
-    func restartOpensNewEpoch() throws {
+    func restartOpensNewEpoch() async throws {
         let collector = FrameTimeCollector()
         let seams = SeamCollector()
         let engine = HLSVideoEngine(url: fixtureURL("restart-witness-av.mp4"), dvModeAvailable: false)
@@ -130,14 +135,8 @@ struct Issue260FrameTimeAxisTests {
 
         engine.requestRestart(at: 1)
 
-        let deadline = Date().addingTimeInterval(30)
-        var restarted: [NativeVideoFrameTime] = []
-        while Date() < deadline {
-            restarted = collector.snapshot().filter { $0.epoch > firstEpoch }
-            if !restarted.isEmpty { break }
-            usleep(50_000)
-        }
-        try #require(!restarted.isEmpty, "restarted producer emitted no frame times within 30s")
+        try await waitFor { collector.snapshot().contains { $0.epoch > firstEpoch } }
+        let restarted = collector.snapshot().filter { $0.epoch > firstEpoch }
 
         // The restart producer starts at segment 1, so its seam sits at that segment's item-axis start,
         // not at 0: a seam of 0 would collapse the history exactly like the pre-#260 behaviour.

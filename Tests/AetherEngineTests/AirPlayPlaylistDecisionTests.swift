@@ -55,6 +55,16 @@ struct AirPlayPlaylistDecisionTests {
         #expect(media.absoluteString == "http://192.168.8.166:52341/media.m3u8")
     }
 
+    @Test("The session token in front of the playlist name survives the media rewrite")
+    func mediaRewriteKeepsSessionToken() throws {
+        // The server refuses any path without its token, so overwriting the whole path here
+        // would hand the receiver an address that 404s.
+        let base = try #require(URL(string: "http://127.0.0.1:52341/9f2c/master.m3u8"))
+        let media = try #require(AirPlayPlaylistDecision.receiverURL(
+            base: base, lanIP: "192.168.8.166", playlist: .media))
+        #expect(media.absoluteString == "http://192.168.8.166:52341/9f2c/media.m3u8")
+    }
+
     @Test("#227: rewriting the media URL again (the fallback path) is idempotent")
     func mediaRewriteIsIdempotent() throws {
         let base = try #require(URL(string: "http://127.0.0.1:52341/media.m3u8"))
@@ -79,5 +89,30 @@ struct AirPlayPlaylistDecisionTests {
     func bypassOnOriginDoesNotReload() {
         #expect(!AirPlayPlaylistDecision.routeChangeNeedsReload(
             isRemoteHLSBypass: true, bypassServesLoopbackOrigin: false))
+    }
+
+    @Test("#526: a live session on a forward-only source swaps its item, as its rebuild is refused")
+    func forwardOnlyLiveSessionSwapsItsItem() {
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: true,
+            isCustomSource: true, customSourceIsSeekable: false) == .swapItem)
+    }
+
+    @Test("A sequential origin swaps its item; every session that can be reopened where it is is rebuilt")
+    func otherSessionsKeepTheirHop() {
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: true, isLive: false,
+            isCustomSource: false, customSourceIsSeekable: false) == .swapItem)
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: false,
+            isCustomSource: false, customSourceIsSeekable: false) == .rebuild)
+        // A seekable custom source rebuilds on its retained reader.
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: true,
+            isCustomSource: true, customSourceIsSeekable: true) == .rebuild)
+        // A live URL source rebuilds and rejoins at the edge.
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: true,
+            isCustomSource: false, customSourceIsSeekable: false) == .rebuild)
     }
 }

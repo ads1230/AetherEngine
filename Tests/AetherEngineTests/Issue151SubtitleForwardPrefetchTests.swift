@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #151 (rrgomes): on direct-play sources the SubtitlePacketStore's forward frontier ends at the
@@ -66,7 +66,7 @@ struct Issue151SubtitleForwardPrefetchTests {
     /// The prefetch loop harvests every routed subtitle packet up to playhead + lead, then PARKS:
     /// nothing past the lead edge may be read while the playhead stands still, and advancing the
     /// playhead resumes the read through EOF.
-    @Test("prefetch harvests to the lead edge, parks, resumes on playhead advance")
+    @Test("prefetch harvests to the lead edge, parks, resumes on playhead advance", .timeLimit(.minutes(2)))
     func prefetchHarvestsToLeadAndParks() async throws {
         let fixture = MatroskaSubtitleFixture.make(
             durationMs: 130_000,
@@ -91,8 +91,7 @@ struct Issue151SubtitleForwardPrefetchTests {
         }
 
         // 2 / 30 / 55 s are inside the lead; 90 s is the packet whose read trips the park.
-        let reachedPark = await Self.waitUntil { store.frontier(streamIndex: 0) == 90 }
-        #expect(reachedPark, "prefetch never reached the park point (frontier=\(store.frontier(streamIndex: 0) ?? -1))")
+        try await waitFor { store.frontier(streamIndex: 0) == 90 }
 
         // Parked: the 120 s event must not be read while the playhead stays at 0.
         try await Task.sleep(nanoseconds: 300_000_000)
@@ -146,6 +145,18 @@ struct Issue151SubtitleForwardPrefetchTests {
             isLive: false, hasEmbeddedDrainTargets: true, hasSource: false))
     }
 
+    @Test("prefetch holds whenever its origin is paced or serial")
+    func meteredOriginHoldTruthTable() {
+        #expect(!SubtitleForwardPrefetcher.shouldHold(
+            originPaced: false, originSerial: false))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: true, originSerial: false))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: false, originSerial: true))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: true, originSerial: true))
+    }
+
     /// A drain-tick jump (seek) re-anchors the prefetcher; a fresh selection (no cursor yet) does
     /// not, because the selection path starts it itself; steady decode ticks never restart it.
     @Test("re-anchor fires on a jump with an existing cursor only")
@@ -165,15 +176,6 @@ struct Issue151SubtitleForwardPrefetchTests {
 
     // MARK: - Helpers
 
-    private static func waitUntil(deadlineSeconds: Double = 5,
-                                  _ condition: @Sendable () -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(deadlineSeconds)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
-        return condition()
-    }
 }
 
 /// Returns the initial playhead exactly once, nil on every later call (engine torn down mid-read).

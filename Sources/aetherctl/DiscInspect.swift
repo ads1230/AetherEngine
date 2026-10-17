@@ -8,7 +8,7 @@ import AetherEngine
 /// does detection bail?". Exit 0 when the image is recognized as playable, else 1.
 func runDiscInspect(url: URL, dump: Bool = false) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl disc-inspect: \(url.absoluteString)")
+    print(EngineLog.redacted("aetherctl disc-inspect: \(url.absoluteString)"))
     print("")
 
     let d = AetherEngine.inspectDisc(url: url, verbose: dump)
@@ -67,6 +67,14 @@ func runDiscInspect(url: URL, dump: Bool = false) -> Int32 {
                 let shown = t.chapterStartsSeconds.prefix(40).map { hms($0) }.joined(separator: ", ")
                 let more = t.chapterStartsSeconds.count > 40 ? ", ..." : ""
                 print("        @ \(shown)\(more)")
+            }
+            // The disc's own declared track languages (#527). Empty means the disc names none, which is
+            // what leaves every track undetermined and language-based selection with nothing to match.
+            if !t.streamLanguages.isEmpty {
+                let shown = t.streamLanguages.sorted { $0.key < $1.key }
+                    .map { String(format: "0x%04X=%@", $0.key, $0.value) }
+                    .joined(separator: ", ")
+                print("        languages: \(shown)")
             }
         }
     }

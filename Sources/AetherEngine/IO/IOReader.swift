@@ -1,6 +1,6 @@
 import Foundation
 
-/// Custom byte source for `AetherEngine.load(source:)`. Use for memory buffers, encrypted containers, or anything not a plain URL. `read`/`seek` run on the engine's demux thread (not main); `close()` is called exactly once at teardown, never between probe and playback.
+/// Custom byte source for `AetherEngine.load(source:)`. Use for memory buffers, encrypted containers, or anything not a plain URL. `read`/`seek` run on the engine's demux thread (not main); `close()` is called exactly once at teardown, never between probe and playback. The engine wraps every call into a reader in an autorelease pool, so a reader is free to use Foundation APIs that hand back autoreleased objects (`FileHandle`, `NSData`) without stranding one per read on a pump thread that runs for the length of the session.
 public protocol IOReader: AnyObject, Sendable {
     /// Read up to `size` bytes into `buffer`. Return bytes read, `0` on EOF, or negative on error. The `buffer` optional reflects the C import convention; the engine never passes nil.
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32
@@ -11,6 +11,10 @@ public protocol IOReader: AnyObject, Sendable {
     func close()
 
     /// Unblock a pending `read` so teardown does not hang. Network readers cancel the in-flight request; memory/file readers can leave this as the default no-op. For readers the engine may reload: unblock only, do not invalidate.
+    /// Controlled metadata probes also call this concurrently on cancellation/deadline, including during
+    /// open and `seek`. Implementations with blocking I/O must promptly interrupt those operations and
+    /// handle cancellation racing their start. A no-op implementation cannot provide an interruptible
+    /// deadline; the synchronous probe still waits for the reader to return before releasing its state.
     func cancel()
 
     /// Return an independent reader with its own cursor over the same source for concurrent access (side demuxer, scrub previews). Return nil for one-shot streams; the engine skips that feature. The returned reader is owned and closed by the engine.
@@ -22,6 +26,15 @@ public protocol IOReader: AnyObject, Sendable {
     /// the sparse signature reads performed by disc recognition. Independent readers should
     /// preserve the same value.
     var discImageProbeEnabled: Bool { get }
+}
+
+/// Internal seam for a custom reader that pulls its bytes over the network and counts them, so a
+/// session reading through it can report `LiveTelemetry.demuxerBytesFetched` like an `AVIOReader`
+/// one does. The engine's own `HTTPDiscIOReader` counts; a host's reader is never asked, and its
+/// sessions keep reporting 0 (`AVIOProvider.cumulativeBytesFetched`).
+protocol SourceTransferCounting: AnyObject {
+    /// Bytes received from the origin since the reader was created.
+    var sourceBytesFetched: Int64 { get }
 }
 
 /// Internal seam for finite segmented sources whose natural seek axis is time,

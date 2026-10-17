@@ -1,42 +1,65 @@
 import Foundation
 import CoreGraphics
 import CoreMedia
-import Libavformat
-import Libavcodec
-import Libavutil
-import Libswscale
+import CoreVideo
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
+import AetherLibswscale
 
 /// Isolated, single-threaded FFmpeg decode context for still-image extraction.
-/// Owns its own Demuxer, AVCodecContext (forced software), and SwsContext, separate
+/// Owns its own Demuxer, AVCodecContext, and SwsContext, separate
 /// from playback. Lazy: ensureOpen() opens on first use, close() is idempotent.
 /// NOT thread-safe; FrameExtractor serializes all access on its decode queue.
 final class FrameDecodeContext: @unchecked Sendable {
     private let url: URL
-    private let httpHeaders: [String: String]
+    private let openedHTTPHeaders: [String: String]
+    /// AE#792: the session's live header set for an extractor over the session's own source, so a
+    /// still fetched after a credential rotation carries the current token. Nil otherwise.
+    private let requestHeaderStore: RequestHeaderStore?
+    private var httpHeaders: [String: String] { requestHeaderStore?.current ?? openedHTTPHeaders }
     /// When non-nil, opens from this independent reader (custom source clone) not the URL.
     /// Closed at deinit, NOT in close() (which tears down only demuxer/decoder so the
     /// idle-reopen path can rebuild over the still-alive reader).
     private let reader: IOReader?
     private let formatHint: String?
+    /// Cache-backed stills run beside native AVPlayer playback, so they may use VideoToolbox.
+    /// Every existing standalone/network extractor keeps the software default from issue #27.
+    private let allowsHardwareDecode: Bool
     /// For a disc image (Blu-ray / DVD ISO) URL, the title to extract stills from. nil = the default
     /// (main) title. Threaded into `Demuxer.open` so a still follows the currently-selected disc title
     /// instead of always decoding the default one (AE#105).
     private let selectTitleID: Int?
+    /// Owned only during a controlled one-shot extraction. The ordinary URL and
+    /// custom-reader paths retain their existing ownership rules.
+    private var boundedReader: IOReader?
 
     private var demuxer: Demuxer?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
+    private var hardwareDeviceContext: UnsafeMutablePointer<AVBufferRef>?
+    private var hardwareDecodeDisabled = false
+    private var loggedHardwareFallback = false
     private var swsContext: UnsafeMutablePointer<SwsContext>?
     private var videoStreamIndex: Int32 = -1
     private var timeBase = AVRational(num: 1, den: 90000)
+    private var presentationStartSeconds: Double?
     /// Source SAR (sample aspect ratio) read from the stream at open. Anamorphic
     /// sources (NTSC/PAL DVD, anamorphic Blu-ray) store non-square pixels; without
     /// this the thumbnail draws square-pixel and looks stretched. Defaults 1:1.
     private var streamSAR = AVRational(num: 1, den: 1)
     private(set) var isOpen = false
+    /// AE#499: the container's colour declaration, captured at open. `isHDR` below is read off
+    /// exactly this, so a frame whose VUI says nothing has to inherit it or the two disagree: the gate
+    /// switches tone mapping on from the container while zscale reads the frame and finds no path to
+    /// linear (`code 3074`), and the still falls back to an untone-mapped conversion.
+    private var containerColor = ColorDescription.unspecified
+
     private(set) var isHDR = false
     /// True for Dolby Vision Profile 5 / Profile 10.0 (no base layer): the decoded planes are
     /// IPT-PQ-C2, not standard YCbCr, so they route through DolbyVisionStillConverter (#103).
     private(set) var isDolbyVisionNoBaseLayer = false
+    /// Diagnostic/test seam for the decoder selected after the first frame.
+    private(set) var hardwareDecoderName: String?
 
     /// Cumulative bytes this context's demuxer pulled from the source (decode-queue only).
     /// Diagnostic: quantifies the extractor's share of link bandwidth per extraction.
@@ -65,6 +88,20 @@ final class FrameDecodeContext: @unchecked Sendable {
             return false
         }
         return false
+    }
+
+    /// Whether a source's frames can become a still in this build. A Dolby Vision Profile 5 / 10.0
+    /// frame needs `DolbyVisionStillConverter`, which only the `DolbyVisionStillReshaping` trait compiles.
+    static func yieldsStill(dolbyVisionNoBaseLayer: Bool) -> Bool {
+        !dolbyVisionNoBaseLayer || AetherEngine.OptionalComponent.dolbyVisionStillReshaping.isBuiltIn
+    }
+
+    /// Whether this open may ask VideoToolbox. A no-base-layer Dolby Vision title stays on software
+    /// (audit BIT-102): VideoToolbox hands 10-bit 4:2:0 over as P010, `DolbyVisionStillConverter` accepts
+    /// only `yuv420p10le`, and the IPT-PQ-C2 planes then went through the BT.2020 tone map, which is the
+    /// green / magenta cast #103 fixed.
+    static func stillUsesHardware(allows: Bool, disabled: Bool, dvNoBaseLayer: Bool) -> Bool {
+        allows && !disabled && !dvNoBaseLayer
     }
 
     /// Thread budget for the disposable still/thumbnail decoder. Capped well below the
@@ -96,21 +133,30 @@ final class FrameDecodeContext: @unchecked Sendable {
         return max(0, duration - clampBackoffSeconds)
     }
 
-    init(url: URL, httpHeaders: [String: String], selectTitleID: Int? = nil) {
+    init(url: URL, httpHeaders: [String: String], selectTitleID: Int? = nil,
+         allowsHardwareDecode: Bool = false, requestHeaderStore: RequestHeaderStore? = nil) {
         self.url = url
-        self.httpHeaders = httpHeaders
+        self.openedHTTPHeaders = httpHeaders
+        self.requestHeaderStore = requestHeaderStore
         self.reader = nil
         self.formatHint = nil
         self.selectTitleID = selectTitleID
+        self.allowsHardwareDecode = allowsHardwareDecode
     }
 
-    init(reader: IOReader, formatHint: String?) {
+    init(reader: IOReader, formatHint: String?, allowsHardwareDecode: Bool = false) {
         // Placeholder; unused when reader != nil (openInternal opens the reader).
         self.url = URL(string: "aether-custom://frame-extractor")!
-        self.httpHeaders = [:]
+        self.openedHTTPHeaders = [:]
+        self.requestHeaderStore = nil
         self.reader = reader
         self.formatHint = formatHint
         self.selectTitleID = nil
+        // DataIOReader is internal and exists for the native segment-cache still path. Recognizing
+        // it here keeps both VOD and live FrameExtractor call sites byte-identical and leaves every
+        // public custom-reader/network caller on the issue #27 software default. The 2026-09-02
+        // device trace measured 30 software context opens in 20 seconds over resident H.264 bytes.
+        self.allowsHardwareDecode = allowsHardwareDecode || reader is DataIOReader
     }
 
     deinit {
@@ -120,10 +166,10 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     /// Open demuxer + decoder if not already open. Throws on failure, leaving the
     /// context fully closed (no partial state to leak).
-    func ensureOpen() throws {
+    func ensureOpen(control: ProbeControl? = nil) throws {
         guard !isOpen else { return }
         do {
-            try openInternal()
+            try openInternal(control: control)
             isOpen = true
         } catch {
             close()
@@ -136,24 +182,62 @@ final class FrameDecodeContext: @unchecked Sendable {
             avcodec_free_context(&codecContext)
         }
         codecContext = nil
+        if hardwareDeviceContext != nil {
+            av_buffer_unref(&hardwareDeviceContext)
+        }
+        hardwareDeviceContext = nil
         if swsContext != nil {
             sws_freeContext(swsContext)
             swsContext = nil
         }
         demuxer?.close()
         demuxer = nil
+        boundedReader?.close()
+        boundedReader = nil
         videoStreamIndex = -1
         isHDR = false
         isDolbyVisionNoBaseLayer = false
+        hardwareDecoderName = nil
         isOpen = false
     }
 
-    private func openInternal() throws {
+    private func openInternal(control: ProbeControl?) throws {
         let demuxer = Demuxer()
-        if let reader = reader {
+        demuxer.probeControl = control
+        if let control {
+            let source: IOReader
+            if let reader {
+                source = reader
+            } else if url.isFileURL {
+                guard let file = FileIOReader(url: url) else { throw DemuxerError.openFailed(code: -1) }
+                source = file
+                boundedReader = file
+            } else if ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                let http = ProbeHTTPReader(url: url, headers: httpHeaders, control: control,
+                                           boundedWindowBytes: 64 * 1024)
+                source = http
+                boundedReader = http
+            } else {
+                throw ProbeError.unsupportedURL
+            }
+            // Count from before demux open through seek and decode. The 64 KiB
+            // HTTP window bounds bytes fetched ahead of the input-byte limit.
+            // Register the cancellation handler BEFORE the HTTP open; a stalled
+            // response header must be interruptible by the same deadline.
+            let counted = ProbeIOReader(reader: source, control: control)
+            try control.check()
+            if let http = source as? ProbeHTTPReader { try http.open() }
+            try control.check()
+            try demuxer.open(reader: counted,
+                             formatHint: formatHint, profile: .stillExtraction,
+                             selectTitleID: selectTitleID)
+            try control.check()
+        } else if let reader = reader {
             try demuxer.open(reader: reader, formatHint: formatHint, profile: .stillExtraction)
         } else {
-            try demuxer.open(url: url, extraHeaders: httpHeaders, profile: .stillExtraction, selectTitleID: selectTitleID)
+            try demuxer.open(url: url, extraHeaders: httpHeaders,
+                             profile: DemuxerOpenProfile.stillExtraction.withRequestHeaders(requestHeaderStore),
+                             selectTitleID: selectTitleID)
         }
         self.demuxer = demuxer
 
@@ -163,6 +247,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
         videoStreamIndex = videoIdx
         timeBase = stream.pointee.time_base
+        presentationStartSeconds = stream.pointee.start_time == Int64.min || timeBase.den <= 0
+            ? nil : Double(stream.pointee.start_time) * Double(timeBase.num) / Double(timeBase.den)
 
         demuxer.discardAllStreamsExcept([videoIdx])
 
@@ -181,26 +267,78 @@ final class FrameDecodeContext: @unchecked Sendable {
         if declared.num > 0, declared.den > 0 {
             streamSAR = declared
         }
+        containerColor = ColorDescription(codecpar: codecpar)
         isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw FrameDecodeError.unsupportedCodec
         }
+        var openedWithHardware = false
+        if Self.stillUsesHardware(allows: allowsHardwareDecode, disabled: hardwareDecodeDisabled,
+                                  dvNoBaseLayer: isDolbyVisionNoBaseLayer) {
+            let deviceResult = av_hwdevice_ctx_create(
+                &hardwareDeviceContext, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nil, nil, 0)
+            if deviceResult >= 0, hardwareDeviceContext != nil {
+                do {
+                    codecContext = try makeCodecContext(
+                        codecpar: codecpar, codec: codec, useHardware: true)
+                    openedWithHardware = true
+                } catch {
+                    disableHardwareDecode("decoder open failed")
+                }
+            } else {
+                disableHardwareDecode("device creation failed ret=\(deviceResult)")
+            }
+        }
+
+        if !openedWithHardware {
+            if hardwareDeviceContext != nil {
+                av_buffer_unref(&hardwareDeviceContext)
+            }
+            hardwareDeviceContext = nil
+            codecContext = try makeCodecContext(
+                codecpar: codecpar, codec: codec, useHardware: false)
+            logOpened(codecpar: codecpar, codec: codec, hardware: "none")
+        }
+    }
+
+    private func makeCodecContext(
+        codecpar: UnsafeMutablePointer<AVCodecParameters>,
+        codec: UnsafePointer<AVCodec>,
+        useHardware: Bool
+    ) throws -> UnsafeMutablePointer<AVCodecContext> {
         guard let ctx = avcodec_alloc_context3(codec) else {
             throw FrameDecodeError.allocationFailed
         }
-        codecContext = ctx
         guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
+            var doomed: UnsafeMutablePointer<AVCodecContext>? = ctx
+            avcodec_free_context(&doomed)
             throw FrameDecodeError.noCodecParameters
         }
-        ctx.pointee.get_format = { _, fmts in
-            guard let fmts = fmts else { return AV_PIX_FMT_NONE }
-            var i = 0
-            while fmts[i] != AV_PIX_FMT_NONE {
-                if fmts[i] != AV_PIX_FMT_VIDEOTOOLBOX { return fmts[i] }
-                i += 1
+
+        if useHardware, let hardwareDeviceContext {
+            ctx.pointee.hw_device_ctx = av_buffer_ref(hardwareDeviceContext)
+            ctx.pointee.get_format = { _, fmts in
+                guard let fmts else { return AV_PIX_FMT_NONE }
+                var fallback = AV_PIX_FMT_NONE
+                var i = 0
+                while fmts[i] != AV_PIX_FMT_NONE {
+                    if fmts[i] == AV_PIX_FMT_VIDEOTOOLBOX { return fmts[i] }
+                    if fallback == AV_PIX_FMT_NONE { fallback = fmts[i] }
+                    i += 1
+                }
+                return fallback
             }
-            return AV_PIX_FMT_YUV420P
+        } else {
+            ctx.pointee.get_format = { _, fmts in
+                guard let fmts = fmts else { return AV_PIX_FMT_NONE }
+                var i = 0
+                while fmts[i] != AV_PIX_FMT_NONE {
+                    if fmts[i] != AV_PIX_FMT_VIDEOTOOLBOX { return fmts[i] }
+                    i += 1
+                }
+                return AV_PIX_FMT_YUV420P
+            }
         }
         ctx.pointee.thread_count = Int32(Self.stillExtractionThreadCount(
             activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
@@ -214,16 +352,71 @@ final class FrameDecodeContext: @unchecked Sendable {
         ctx.pointee.flags2 |= AV_CODEC_FLAG2_FAST_VALUE
 
         var opts: OpaquePointer?
-        // SW decode is forced by the get_format callback above (rejects VIDEOTOOLBOX).
-        // The "hwaccel" entry is a no-op at avcodec_open2, kept for parity with SoftwareVideoDecoder.
-        av_dict_set(&opts, "hwaccel", "none", 0)
-        guard avcodec_open2(ctx, codec, &opts) >= 0 else {
-            av_dict_free(&opts)
+        if !useHardware {
+            // Belt-and-suspenders with the software get_format callback above.
+            av_dict_set(&opts, "hwaccel", "none", 0)
+        }
+        let openResult = avcodec_open2(ctx, codec, &opts)
+        av_dict_free(&opts)
+        guard openResult >= 0 else {
+            var doomed: UnsafeMutablePointer<AVCodecContext>? = ctx
+            avcodec_free_context(&doomed)
             throw FrameDecodeError.decoderOpenFailed
         }
-        av_dict_free(&opts)
+        return ctx
+    }
 
-        EngineLog.emit("[FrameDecode] Opened \(codecpar.pointee.width)x\(codecpar.pointee.height) codec=\(String(cString: codec.pointee.name)) threads=\(ctx.pointee.thread_count)", category: .swPlayback)
+    private func disableHardwareDecode(_ reason: String) {
+        hardwareDecodeDisabled = true
+        if !loggedHardwareFallback {
+            loggedHardwareFallback = true
+            EngineLog.emit(
+                "[FrameDecode] VideoToolbox unavailable; using software (\(reason))",
+                category: .swPlayback)
+        }
+    }
+
+    private func logOpened(
+        codecpar: UnsafeMutablePointer<AVCodecParameters>,
+        codec: UnsafePointer<AVCodec>,
+        hardware: String
+    ) {
+        hardwareDecoderName = hardware
+        guard let ctx = codecContext else { return }
+        EngineLog.emit(
+            "[FrameDecode] Opened \(codecpar.pointee.width)x\(codecpar.pointee.height) "
+            + "codec=\(String(cString: codec.pointee.name)) threads=\(ctx.pointee.thread_count) "
+            + "hw=\(hardware)",
+            category: .swPlayback)
+    }
+
+    private func replaceHardwareDecoderWithSoftware(reason: String) -> Bool {
+        disableHardwareDecode(reason)
+        if codecContext != nil {
+            avcodec_free_context(&codecContext)
+        }
+        codecContext = nil
+        if hardwareDeviceContext != nil {
+            av_buffer_unref(&hardwareDeviceContext)
+        }
+        hardwareDeviceContext = nil
+        hardwareDecoderName = nil
+
+        guard let stream = demuxer?.stream(at: videoStreamIndex),
+              let codecpar = stream.pointee.codecpar,
+              let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
+            isOpen = false
+            return false
+        }
+        do {
+            codecContext = try makeCodecContext(
+                codecpar: codecpar, codec: codec, useHardware: false)
+            logOpened(codecpar: codecpar, codec: codec, hardware: "none")
+            return true
+        } catch {
+            isOpen = false
+            return false
+        }
     }
 
     // MARK: - Decode
@@ -240,9 +433,17 @@ final class FrameDecodeContext: @unchecked Sendable {
         mode: FrameMode,
         targetWidth: Int,
         maxSize: CGSize?,
-        isCancelled: () -> Bool
+        afterFirstFrame offsetSeconds: Double? = nil,
+        isCancelled: () -> Bool,
+        residentTarget: Double? = nil,
+        reportResidentTime: ((Double, Bool) -> Void)? = nil,
+        residentDeadline: ContinuousClock.Instant? = nil,
+        reportDecodedTime: ((Double?) -> Void)? = nil
     ) -> CGImage? {
         guard isOpen, let ctx = codecContext, let demuxer else { return nil }
+        // Without the reshaping these planes are IPT, which the standard path would read as YCbCr
+        // (the green / magenta still of #103): no still at all, and nothing read or decoded for it.
+        guard Self.yieldsStill(dolbyVisionNoBaseLayer: isDolbyVisionNoBaseLayer) else { return nil }
 
         // Bound this decode's HTTP reads so a stalled remote source can't park the
         // serial decode queue and freeze the scrub preview (issue #27). No-op for
@@ -270,19 +471,76 @@ final class FrameDecodeContext: @unchecked Sendable {
                 category: .swPlayback)
         }
 
-        demuxer.seek(to: seekSeconds)
+        // A resident reader contains one segment. The request already carries
+        // the raw target restored from its byte epoch, independent of tfdt zero.
+        if let residentTarget, mode == .snapshot {
+            guard let start = presentationStartSeconds, abs(residentTarget - start) <= 12 else { return nil }
+        }
+        demuxer.seek(to: residentTarget == nil ? seekSeconds : 0)
 
-        guard timeBase.num > 0 else { return nil }
-        let targetPTS = Int64((seekSeconds * Double(timeBase.den)) / Double(timeBase.num))
+        // A resident frame is compared on its source PTS axis, including any nonzero segment origin.
+        // A target the stream's own time base cannot hold is no position in it (audit BIT-105).
+        let targetSeconds = residentTarget ?? seekSeconds
+        guard var targetPTS = Demuxer.ticks(forSeconds: targetSeconds, timeBase: timeBase) else { return nil }
+        // AE#711 follow-up: a target measured from the first frame decoded rather than on the stream's
+        // axis, for a cache segment whose fMP4 tfdt may be absolute or zero-based (after a producer
+        // restart). Fixed on the first frame that carries a PTS.
+        var offsetTicks: Int64?
+        if let offsetSeconds {
+            guard let ticks = Demuxer.ticks(forSeconds: max(0, offsetSeconds), timeBase: timeBase) else { return nil }
+            offsetTicks = ticks
+        }
+        let deadline = residentDeadline ?? ContinuousClock.now.advanced(by: .milliseconds(750))
+        var packetCount = 0
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard frame != nil else { return nil }
         defer { av_frame_free(&frame) }
 
-        func makeImage(_ f: UnsafeMutablePointer<AVFrame>) -> CGImage? {
+        var hardwareTransferFailure: Int32?
+        func makeImage(_ decodedFrame: UnsafeMutablePointer<AVFrame>) -> CGImage? {
+            var transferredFrame: UnsafeMutablePointer<AVFrame>?
+            let f: UnsafeMutablePointer<AVFrame>
+            if decodedFrame.pointee.format == AV_PIX_FMT_VIDEOTOOLBOX.rawValue {
+                transferredFrame = av_frame_alloc()
+                guard let transferTarget = transferredFrame else { return nil }
+                let transferResult = av_hwframe_transfer_data(transferTarget, decodedFrame, 0)
+                guard transferResult >= 0 else {
+                    hardwareTransferFailure = transferResult
+                    av_frame_free(&transferredFrame)
+                    return nil
+                }
+                let propertyResult = av_frame_copy_props(transferTarget, decodedFrame)
+                guard propertyResult >= 0 else {
+                    hardwareTransferFailure = propertyResult
+                    av_frame_free(&transferredFrame)
+                    return nil
+                }
+                f = transferTarget
+                if hardwareDecoderName == nil,
+                   let stream = demuxer.stream(at: videoStreamIndex),
+                   let codecpar = stream.pointee.codecpar,
+                   let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
+                    logOpened(codecpar: codecpar, codec: codec, hardware: "videotoolbox")
+                }
+            } else {
+                f = decodedFrame
+                if hardwareDecoderName == nil,
+                   let stream = demuxer.stream(at: videoStreamIndex),
+                   let codecpar = stream.pointee.codecpar,
+                   let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
+                    logOpened(codecpar: codecpar, codec: codec, hardware: "none")
+                }
+            }
+            defer {
+                if transferredFrame != nil {
+                    av_frame_free(&transferredFrame)
+                }
+            }
             let width = mode == .thumbnail
                 ? targetWidth
                 : Self.clampedWidth(frame: f, maxSize: maxSize)
+            #if DolbyVisionStillReshaping
             if isDolbyVisionNoBaseLayer {
                 let sar = resolvedSAR(frame: f)
                 if let img = DolbyVisionStillConverter.makeImage(frame: f, targetWidth: width, sar: sar) {
@@ -290,6 +548,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                 }
                 // No DV metadata on this frame / unsupported layout: fall through to the standard path.
             }
+            #endif
             if isHDR {
                 var toned = HDRToneMapper.toneMap(frame: f, targetWidth: width, timeBase: timeBase)
                 if toned != nil {
@@ -307,6 +566,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         var draining = false
         while true {
             if isCancelled() { return nil }
+            if residentTarget != nil, (ContinuousClock.now >= deadline || packetCount >= 900) { return nil }
 
             if !draining {
                 let packetOrNil: UnsafeMutablePointer<AVPacket>?
@@ -320,6 +580,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                     draining = true
                     continue
                 }
+                packetCount += 1
                 if packet.pointee.stream_index != videoStreamIndex {
                     av_packet_unref(packet)
                     av_packet_free_safe(packet)
@@ -345,9 +606,17 @@ final class FrameDecodeContext: @unchecked Sendable {
                     break                           // real error: try next packet
                 }
 
+                // AE#499: before the DV, tone-map and sws branches below read it, and before the
+                // hardware transfer copies its props onto the software frame.
+                ColorDescription.backfill(frame: f, container: containerColor)
+
                 // Skip frames before targetPTS for frame-accuracy. No-PTS frames
                 // (AV_NOPTS_VALUE == Int64.min) are accepted, so PTS-less streams
                 // degrade to the first frame after the seek.
+                if let ticks = offsetTicks, f.pointee.pts != Int64.min {
+                    targetPTS = f.pointee.pts + ticks
+                    offsetTicks = nil
+                }
                 if mode == .snapshot,
                    f.pointee.pts != Int64.min,
                    f.pointee.pts < targetPTS {
@@ -355,7 +624,35 @@ final class FrameDecodeContext: @unchecked Sendable {
                 }
 
                 if isCancelled() { return nil }
-                return makeImage(f)
+                let image = makeImage(f)
+                if let hardwareTransferFailure {
+                    guard replaceHardwareDecoderWithSoftware(
+                        reason: "frame transfer failed ret=\(hardwareTransferFailure)") else {
+                        return nil
+                    }
+                    return decodeFrame(
+                        at: seconds,
+                        mode: mode,
+                        targetWidth: targetWidth,
+                        maxSize: maxSize,
+                        afterFirstFrame: offsetSeconds,
+                        isCancelled: isCancelled,
+                        residentTarget: residentTarget,
+                        reportResidentTime: reportResidentTime,
+                        residentDeadline: deadline,
+                        reportDecodedTime: reportDecodedTime)
+                }
+                if let residentTarget {
+                    guard f.pointee.pts != Int64.min else { return nil }
+                    let raw = Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den)
+                    guard raw.isFinite else { return nil }
+                    reportResidentTime?(raw, mode == .snapshot && raw >= residentTarget &&
+                        presentationStartSeconds.map { residentTarget >= $0 } == true)
+                }
+                let decodedPTS = f.pointee.pts == Int64.min ? nil
+                    : Optional(Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den))
+                reportDecodedTime?(decodedPTS.flatMap { $0.isFinite ? $0 : nil })
+                return image
             }
         }
     }
@@ -427,6 +724,29 @@ final class FrameDecodeContext: @unchecked Sendable {
         return AVRational(num: 1, den: 1)
     }
 
+    /// The sws coefficient table for the matrix `ColorAttachments.presented` resolves, so a gap is
+    /// filled here exactly as it is on the buffer playback shows.
+    static func swsColorspace(for description: ColorDescription) -> Int32 {
+        switch ColorAttachments.presented(description).matrix {
+        case kCVImageBufferYCbCrMatrix_ITU_R_601_4:     SWS_CS_ITU601
+        case kCVImageBufferYCbCrMatrix_ITU_R_2020:      SWS_CS_BT2020
+        case kCVImageBufferYCbCrMatrix_SMPTE_240M_1995: SWS_CS_SMPTE240M
+        default:                                        SWS_CS_ITU709
+        }
+    }
+
+    /// Full range when the frame says so, or when its pixel format is one of the JPEG variants that
+    /// carry the range in the format rather than in `color_range`.
+    static func isFullRange(_ frame: UnsafePointer<AVFrame>) -> Bool {
+        if frame.pointee.color_range == AVCOL_RANGE_JPEG { return true }
+        switch AVPixelFormat(rawValue: frame.pointee.format) {
+        case AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ411P:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// sws_scale the frame to RGBA at `targetWidth` (height from source aspect) into an
     /// owned-buffer CGImage. Mirrors the sws tuple-pointer dance in SoftwareVideoDecoder.
     private func convertToCGImage(frame: UnsafeMutablePointer<AVFrame>, targetWidth: Int) -> CGImage? {
@@ -449,6 +769,14 @@ final class FrameDecodeContext: @unchecked Sendable {
             Int32(SWS_BILINEAR.rawValue), nil, nil, nil
         )
         guard swsContext != nil else { return nil }
+        // Without this sws converts every picture with its BT.601 default, which put a 1080p
+        // BT.709 colour bar up to 33 levels off in the still while playback showed it right.
+        // The matrix comes from the rule the displayed buffer is tagged by, so both agree.
+        let description = ColorDescription(frame: frame)
+        let coefficients = sws_getCoefficients(Self.swsColorspace(for: description))
+        sws_setColorspaceDetails(
+            swsContext, coefficients, Self.isFullRange(frame) ? 1 : 0,
+            coefficients, 1, 0, 1 << 16, 1 << 16)
 
         let bytesPerRow = dstW * 4
         var rgba = [UInt8](repeating: 0, count: bytesPerRow * dstH)
@@ -486,7 +814,8 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         let data = Data(rgba)
         guard let provider = CGDataProvider(data: data as CFData),
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+              let colorSpace = ColorAttachments.colorSpace(for: ColorAttachments.presented(description))
+                ?? CGColorSpace(name: CGColorSpace.sRGB) else {
             return nil
         }
         // sws_scale RGBA yields opaque pixels (alpha 0xFF), so alpha is ignorable not premultiplied.

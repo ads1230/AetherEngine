@@ -10,6 +10,7 @@ import AVFoundation
 /// have, so bitrate, throughput and transferred bytes were a hard zero for the whole session rather
 /// than the real numbers. And the read-ahead the path does hold was computed for the memprobe only,
 /// so nothing on the public surface answered "is the network keeping up" where it matters most.
+@Suite(.timeLimit(.minutes(2)))
 @MainActor
 struct Issue306SoftwareTelemetryTests {
 
@@ -19,18 +20,6 @@ struct Issue306SoftwareTelemetryTests {
         return engine
     }
 
-    private func waitUntil(
-        timeout: Duration = .seconds(90),
-        _ condition: @MainActor () -> Bool
-    ) async throws -> Bool {
-        let clock = ContinuousClock()
-        let start = clock.now
-        while !condition() {
-            if clock.now - start > timeout { return false }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        return true
-    }
 
     // MARK: - The byte counter
 
@@ -112,8 +101,7 @@ struct Issue306SoftwareTelemetryTests {
                 accumulatedFrameDelaySeconds: 0.21)
         })
         sampler.start()
-        let published = try await waitUntil { engine.diagnostics.liveTelemetry != nil }
-        #expect(published)
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         let snapshot = engine.diagnostics.liveTelemetry
         #expect(snapshot?.displayCushionSeconds == 0.36)
         #expect(snapshot?.readerWindowAheadBytes == 3_145_728)
@@ -132,8 +120,7 @@ struct Issue306SoftwareTelemetryTests {
             SoftwareReadings(displayCushionSeconds: 0.02)
         })
         sampler.start()
-        let published = try await waitUntil { engine.diagnostics.liveTelemetry != nil }
-        #expect(published)
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         #expect(engine.diagnostics.liveTelemetry?.forwardBufferSeconds == nil)
         #expect(engine.diagnostics.liveTelemetry?.displayCushionSeconds == 0.02)
         sampler.stop()
@@ -147,8 +134,7 @@ struct Issue306SoftwareTelemetryTests {
         let engine = try makeSoftwareEngine()
         let sampler = LiveTelemetrySampler(engine: engine, softwareRead: { _ in SoftwareReadings() })
         sampler.start()
-        let published = try await waitUntil { engine.diagnostics.liveTelemetry != nil }
-        #expect(published)
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         #expect(engine.diagnostics.liveTelemetry?.droppedFrameCount == nil)
         #expect(engine.diagnostics.liveTelemetry?.displayCushionSeconds == nil)
         #expect(engine.diagnostics.liveTelemetry?.accumulatedFrameDelaySeconds == nil)
@@ -166,7 +152,7 @@ struct Issue306SoftwareTelemetryTests {
         let sampler = LiveTelemetrySampler(engine: engine, softwareRead: { _ in
             entered.set(true)
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                DispatchQueue.global().async {
+                Thread.detachNewThread {
                     release.wait()
                     continuation.resume()
                 }
@@ -174,8 +160,7 @@ struct Issue306SoftwareTelemetryTests {
             return SoftwareReadings(displayCushionSeconds: 0.36)
         })
         sampler.start()
-        let readStarted = try await waitUntil { entered.get() }
-        #expect(readStarted)
+        try await waitFor { entered.get() }
         // Teardown seam: the session ends while the metrics read is still in flight.
         engine.playbackBackend = .none
         release.signal()
@@ -197,8 +182,7 @@ struct Issue306SoftwareTelemetryTests {
             nativeRead: { _, _ in NativeAVFReadings(forwardBufferSeconds: 12.0) },
             softwareRead: { _ in SoftwareReadings(displayCushionSeconds: 0.36, droppedFrameCount: 8) })
         sampler.start()
-        let published = try await waitUntil { engine.diagnostics.liveTelemetry != nil }
-        #expect(published)
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         #expect(engine.diagnostics.liveTelemetry?.forwardBufferSeconds == 12.0)
         #expect(engine.diagnostics.liveTelemetry?.displayCushionSeconds == nil)
         #expect(engine.diagnostics.liveTelemetry?.accumulatedFrameDelaySeconds == nil)

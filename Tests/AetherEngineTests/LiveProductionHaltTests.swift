@@ -23,6 +23,32 @@ final class LiveProductionHaltTests: XCTestCase {
             "non-halted signal-less live keeps the low-latency default")
     }
 
+    // MARK: - Delivery stall (AE#446)
+
+    /// Same policy as the halt above, applied one watchdog earlier. A source that has stopped
+    /// delivering cannot satisfy a blocking reload either, and holding the client's poll for
+    /// 3 x TARGETDURATION costs it every segment it would otherwise have fetched from the cache.
+    func testDeliveryStallBeatsOverrideAndPolicy() {
+        XCTAssertFalse(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: true, override: true, policy: nil),
+            "a source that is not delivering cannot honor blocking-reload however loudly the host asks")
+        XCTAssertFalse(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: true, override: nil, policy: nil))
+        XCTAssertTrue(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: false, override: nil, policy: nil),
+            "a delivering source keeps the low-latency default")
+    }
+
+    func testHaltAndDeliveryStallAreIndependentRoutesToTheSameAnswer() {
+        XCTAssertFalse(VideoSegmentProvider.resolveLiveBlockingReload(
+            halted: true, deliveryStalled: false, override: true, policy: nil))
+        XCTAssertFalse(VideoSegmentProvider.resolveLiveBlockingReload(
+            halted: false, deliveryStalled: true, override: true, policy: nil))
+    }
+
     // MARK: - Pump-exit classification
 
     func testHostRetuneExitsHaltLiveProduction() {
@@ -30,7 +56,7 @@ final class LiveProductionHaltTests: XCTestCase {
             reason: .segmentStall, sourceReopenable: true),
             "cutter wedge exits to host retune; the provider will never cut again")
         XCTAssertTrue(HLSVideoEngine.shouldHaltLiveProduction(
-            reason: .sourceReplay, sourceReopenable: true))
+            reason: .sourceReplay, sourceReopenable: false))
         XCTAssertTrue(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .eof, sourceReopenable: false),
             "host-provided custom-reader pump death delegates to host retune")
@@ -39,6 +65,9 @@ final class LiveProductionHaltTests: XCTestCase {
     }
 
     func testRecoverableExitsDoNotHaltLiveProduction() {
+        XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
+            reason: .sourceReplay, sourceReopenable: true),
+            "fresh source continues the retained cache and its exact-packet history")
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .eof, sourceReopenable: true),
             "reopenable exits (URL source, or #199 engine-created ingest reader with a fresh-reader factory) resume cutting into the same provider")
@@ -120,15 +149,16 @@ final class LiveProductionHaltTests: XCTestCase {
         final class ResultBox: @unchecked Sendable { var value = true }
         let box = ResultBox()
         let released = expectation(description: "held blocking-reload waiter released")
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             // The reporter's shape: playlist ends at segment 11, AVPlayer holds ?_HLS_msn=12.
-            box.value = provider.waitForLiveSegment(index: 12, timeout: 10)
+            // A timeout out of reach, so only the halt can release it.
+            box.value = provider.waitForLiveSegment(index: 12, timeout: 600)
             released.fulfill()
         }
-        Thread.sleep(forTimeInterval: 0.2)  // let the waiter park
+        while provider.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
         provider.markLiveProductionHalted()
-        wait(for: [released], timeout: 2.0)
-        XCTAssertFalse(box.value, "released waiter must report the segment as unavailable, well before its 10s timeout")
+        wait(for: [released], timeout: 300)
+        XCTAssertFalse(box.value, "released waiter must report the segment as unavailable, well before its own timeout")
         XCTAssertFalse(provider.liveBlockingReloadEnabled,
                        "halted session must stop advertising CAN-BLOCK-RELOAD, beating the host override")
     }
@@ -150,7 +180,7 @@ final class LiveProductionHaltTests: XCTestCase {
             semaphore.signal()
         }
         task.resume()
-        XCTAssertEqual(semaphore.wait(timeout: .now() + 5), .success, "request to \(url) timed out")
+        XCTAssertEqual(semaphore.wait(timeout: .now() + 120), .success, "request to \(url) timed out")
         if let error = box.error { throw error }
         return (box.status, box.body)
     }
@@ -160,7 +190,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=99")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=99")!)
         XCTAssertEqual(result.status, 503,
                        "a held blocking reload that cannot be satisfied must 503 (retriable), never serve the unchanged playlist (-15410)")
     }
@@ -170,7 +200,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=2")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=2")!)
         XCTAssertEqual(result.status, 200)
         XCTAssertTrue(result.body.contains("#EXTM3U"), "satisfied hold serves the playlist as before")
     }
@@ -182,7 +212,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=99")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=99")!)
         XCTAssertEqual(result.status, 200)
         XCTAssertTrue(result.body.contains("#EXTM3U"))
         XCTAssertEqual(provider.holdCalls, 0, "gate OFF must never park the request in waitForLiveSegment")

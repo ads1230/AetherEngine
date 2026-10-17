@@ -16,10 +16,11 @@ final class HLSPlaylistTrackerTests: XCTestCase {
     }
 
     func testPrimesAtLiveEdgeWithCoverageTarget() {
-        // 4s segments: coverage = max(8, 1.5*4) = 8s -> join takes exactly two segments.
+        // 4s segments: the loopback cushion wants 3 x ceil(4 / 1.5) = 9s plus a 4s GOP margin, so
+        // 13s; edgeOffset caps the join at three segments.
         var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         let new = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b", "c", "d", "e", "f"]))
-        XCTAssertEqual(new.map(\.uri), ["e", "f"])
+        XCTAssertEqual(new.map(\.uri), ["d", "e", "f"])
         XCTAssertEqual(tracker.stallCount, 0)
     }
 
@@ -31,17 +32,19 @@ final class HLSPlaylistTrackerTests: XCTestCase {
     }
 
     func testPrimeCoversUpstreamCadenceForLongSegments() {
-        // 12s segments: coverage = max(8, 1.5*12) = 18s -> two segments (24s) cover a full upstream gap.
+        // 12s segments: 1.5 x 12 = 18s covers one upstream gap, but the loopback seals TD 8 and wants
+        // 24s + 4s of margin, so the whole three-segment window.
         var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         let new = tracker.newSegments(in: playlist(sequence: 50, uris: ["a", "b", "c"], duration: 12))
-        XCTAssertEqual(new.map(\.uri), ["b", "c"])
+        XCTAssertEqual(new.map(\.uri), ["a", "b", "c"])
     }
 
     func testPrimeCoversBurstyTenSecondUpstream() {
-        // Device-repro shape: 10s segments. Coverage = max(8, 1.5*10) = 15s -> two segments / 20s.
+        // Device-repro shape: 10s segments. 1.5 x 10 = 15s took two segments / 20s, one short of the
+        // 21s holdback TD 7 seals (AE#678); 21s + 4s of margin takes three.
         var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         let new = tracker.newSegments(in: playlist(sequence: 7, uris: ["a", "b", "c", "d"], duration: 10))
-        XCTAssertEqual(new.map(\.uri), ["c", "d"])
+        XCTAssertEqual(new.map(\.uri), ["b", "c", "d"])
     }
 
     func testPrimesAtWindowStartWhenWindowIsShort() {
@@ -71,9 +74,9 @@ final class HLSPlaylistTrackerTests: XCTestCase {
     func testWindowSlidePastCursorRejoinsAtEdgeWithDiscontinuity() {
         var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         _ = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b", "c"]))
-        // Window slid past cursor: rejoin at edge (duration-capped to two 4s segments).
+        // Window slid past cursor: rejoin at edge with the same depth as a join (three 4s segments).
         let new = tracker.newSegments(in: playlist(sequence: 500, uris: ["x", "y", "z", "w", "v", "u"]))
-        XCTAssertEqual(new.map(\.uri), ["v", "u"])
+        XCTAssertEqual(new.map(\.uri), ["w", "v", "u"])
         XCTAssertTrue(new[0].discontinuityBefore, "rejoin must be marked as a discontinuity")
     }
 
@@ -87,7 +90,7 @@ final class HLSPlaylistTrackerTests: XCTestCase {
         XCTAssertTrue(tracker.newSegments(in: playlist(sequence: 0, uris: ["x", "y", "z"])).isEmpty)
         XCTAssertTrue(tracker.newSegments(in: playlist(sequence: 0, uris: ["x", "y", "z"])).isEmpty)
         let rejoined = tracker.newSegments(in: playlist(sequence: 0, uris: ["x", "y", "z"]))
-        XCTAssertEqual(rejoined.map(\.uri), ["y", "z"], "third consecutive regression rejoins at the new edge")
+        XCTAssertEqual(rejoined.map(\.uri), ["x", "y", "z"], "third consecutive regression rejoins at the new edge")
         XCTAssertTrue(rejoined[0].discontinuityBefore, "reset rejoin must be marked as a discontinuity")
         // Cursor continues normally on the new sequence axis.
         let next = tracker.newSegments(in: playlist(sequence: 1, uris: ["y", "z", "w"]))
@@ -117,5 +120,76 @@ final class HLSPlaylistTrackerTests: XCTestCase {
         // Regressions are reset evidence, not upstream silence; they must not push the
         // reader's stall counter toward its ingestStalled terminal trip.
         XCTAssertEqual(tracker.stallCount, 0)
+    }
+
+    // MARK: - Default join depth
+
+    func testDefaultJoinReachesTheCoverageTargetOnShortSegments() {
+        // The case the old count cap of 3 defeated: 1s segments want 8s of coverage, and the cap
+        // handed over 3s. Three joined segments finalize only two downstream (the last is still
+        // open), one short of the loopback startup cushion, so the join then waited a segment
+        // duration in wall clock for content the origin already had.
+        var tracker = HLSPlaylistTracker()
+        let uris = (0..<12).map { "s\($0)" }
+        let new = tracker.newSegments(in: playlist(sequence: 40, uris: uris, duration: 1))
+        XCTAssertEqual(new.map(\.uri), ["s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"])
+    }
+
+    func testDefaultJoinLeavesTheOldestSegmentOfADeepWindow() {
+        // Eviction margin: the oldest listed segment is the one closest to being dropped, so the
+        // burst stops one short of it rather than racing the origin for a 404.
+        var tracker = HLSPlaylistTracker()
+        let new = tracker.newSegments(
+            in: playlist(sequence: 7, uris: ["a", "b", "c", "d", "e", "f", "g", "h"], duration: 1)
+        )
+        XCTAssertEqual(new.map(\.uri), ["b", "c", "d", "e", "f", "g", "h"])
+    }
+
+    func testDefaultJoinTakesAFloorDepthWindowWhole() {
+        // Three segments is as shallow as a live window is expected to get, so there is nothing to
+        // hold back and the margin does not apply. Byte-identical to the behaviour before the cap
+        // was raised, which is what keeps the change invisible to a minimal origin.
+        var tracker = HLSPlaylistTracker()
+        let new = tracker.newSegments(in: playlist(sequence: 12, uris: ["a", "b", "c"], duration: 1))
+        XCTAssertEqual(new.map(\.uri), ["a", "b", "c"])
+    }
+
+    func testDefaultJoinCoversTheLoopbackCushionForLongSegments() {
+        // AE#678: a 6s provider seals TD 4 downstream, so the first serve wants 12s, and two joined
+        // segments finalize only 12s minus the open GOP. The cushion term takes a third.
+        var tracker = HLSPlaylistTracker()
+        let new = tracker.newSegments(
+            in: playlist(sequence: 3, uris: ["a", "b", "c", "d", "e", "f"], duration: 6)
+        )
+        XCTAssertEqual(new.map(\.uri), ["d", "e", "f"])
+    }
+
+    func testLoopbackCushionCoverageIsTheSealedHoldbackPlusAGOP() {
+        func coverage(_ durations: [Double]) -> Double {
+            HLSPlaylistTracker.loopbackCushionCoverageSeconds(segments: durations.enumerated().map {
+                HLSMediaSegment(uri: "s\($0.offset)", duration: $0.element, discontinuityBefore: false)
+            })
+        }
+        XCTAssertEqual(coverage([10, 10, 10]), 25)       // TD 7, 21s holdback, 4s margin
+        XCTAssertEqual(coverage([12, 13.5, 12]), 31)     // TD 9 from the longest, 27s + 4s
+        XCTAssertEqual(coverage([2, 2, 2]), 8)           // TD 2, 6s + a 2s GOP bounded by the segment
+        XCTAssertEqual(coverage([1, 1, 1]), 4)           // below the 8s floor, which then decides
+        XCTAssertEqual(coverage([]), 0)
+    }
+
+    // audit NET-3: a MEDIA-SEQUENCE the parser somehow let through near Int.max used to trap
+    // `mediaSequence + segments.count` here. `&+`/`&-` compute mod 2^64, so relative distances
+    // (and therefore which segments are new) come out the same as at a small sequence number.
+    func testDoesNotTrapOnMediaSequenceNearIntMax() {
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
+        let new = tracker.newSegments(in: playlist(sequence: Int.max - 1, uris: ["a", "b", "c"]))
+        XCTAssertEqual(new.map(\.uri), ["a", "b", "c"])
+    }
+
+    func testJoinSegmentLimitAppliesTheMarginOnlyBelowTheCap() {
+        XCTAssertEqual(HLSPlaylistTracker.joinSegmentLimit(edgeOffset: 8, windowSegmentCount: 3), 8)
+        XCTAssertEqual(HLSPlaylistTracker.joinSegmentLimit(edgeOffset: 8, windowSegmentCount: 4), 3)
+        XCTAssertEqual(HLSPlaylistTracker.joinSegmentLimit(edgeOffset: 8, windowSegmentCount: 9), 8)
+        XCTAssertEqual(HLSPlaylistTracker.joinSegmentLimit(edgeOffset: 8, windowSegmentCount: 20), 8)
     }
 }

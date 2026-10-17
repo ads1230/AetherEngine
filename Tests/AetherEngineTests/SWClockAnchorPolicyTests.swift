@@ -62,12 +62,91 @@ struct SWClockAnchorPolicyTests {
         #expect(r.sessionZeroSeconds == 2.01)
     }
 
-    @Test("session zero never goes negative when the stream starts before the anchor")
+    @Test("a first sample behind the anchor keeps the load anchor (AE#724 resume preroll)")
     func firstSampleBehindAnchor() {
-        // A first sample far BEHIND the requested anchor (broken seek) still re-anchors
-        // so samples present, but session zero clamps at 0 to keep positions monotonic.
-        let r = SWClockAnchorPolicy.resolve(initialSeconds: 64000, firstSampleSeconds: 10)
-        #expect(r.anchorSeconds == 10)
+        // A resume lands on the keyframe at or before the target, and its audio starts with it.
+        // Measured on a 10 s GOP: anchor 17.3, first decoded audio 9.984. That is preroll the
+        // skip threshold and the synchronizer discard, not a source that starts elsewhere.
+        let r = SWClockAnchorPolicy.resolve(initialSeconds: 17.3, firstSampleSeconds: 9.984)
+        #expect(r.anchorSeconds == 17.3)
         #expect(r.sessionZeroSeconds == 0)
+    }
+
+    @Test("a first sample far behind the anchor keeps it too")
+    func firstSampleFarBehindAnchor() {
+        // A reposition that fell back to the head of the file: the video skip threshold still
+        // stands at the anchor, so a clock moved back to the head would play audio under a
+        // picture that cannot present until the anchor anyway.
+        let r = SWClockAnchorPolicy.resolve(initialSeconds: 64000, firstSampleSeconds: 10)
+        #expect(r.anchorSeconds == 64000)
+        #expect(r.sessionZeroSeconds == 0)
+    }
+
+    @Test("a large negative first PTS on a cold start keeps the zero anchor")
+    func largeNegativeFirstPts() {
+        let r = SWClockAnchorPolicy.resolve(initialSeconds: 0, firstSampleSeconds: -5)
+        #expect(r.anchorSeconds == 0)
+        #expect(r.sessionZeroSeconds == 0)
+    }
+
+    // MARK: - Session zero for a resume on an offset-origin source
+
+    @Test("a resume on a source whose timestamps start at 600 s carries the origin as session zero")
+    func resumeOnOffsetOrigin() {
+        // Measured on `-output_ts_offset 600`: a 17.3 s resume landed on the source's first
+        // packet (600.0) while publishing 18.2, because the target reached the demuxer unconverted.
+        #expect(SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: 599.979) == 599.979)
+    }
+
+    @Test("an origin inside the tolerance stays a zero-based source, as on a cold start")
+    func resumeOnNearZeroOrigin() {
+        for origin in [0, 0.021, 1.4, 2.0] {
+            #expect(SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: origin) == 0)
+        }
+    }
+
+    @Test("an unknown or negative origin is no session zero")
+    func resumeOnUnknownOrigin() {
+        for origin in [Double.nan, .infinity, -5] {
+            #expect(SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: origin) == 0)
+        }
+    }
+
+    // MARK: - Carrying a seek target back to the source axis
+
+    @Test("a zero-based source seeks on the axis it already uses")
+    func sourceSecondsIsIdentityWithoutAnOffset() {
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 35.29, sessionZeroSeconds: 0) == 35.29)
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 0, sessionZeroSeconds: 0) == 0)
+    }
+
+    @Test("a mid-stream-joined source seeks past its own first packet, not before it")
+    func sourceSecondsCarriesTheOffset() {
+        // The capture that found this: first PTS 24549.835 s, a 64 s file, and a
+        // seek to 35.29 s of session time. Without the carry the demuxer is asked
+        // for a timestamp six hours before the file begins and clamps to its start,
+        // and the packet store's reservoir reads as the whole offset.
+        let target = SWClockAnchorPolicy.sourceSeconds(
+            forSession: 35.29,
+            sessionZeroSeconds: 24_549.835
+        )
+        #expect(target == 24_585.125)
+    }
+
+    @Test("the carry is the inverse of the position the host publishes")
+    func sourceSecondsRoundTripsThePublishedPosition() {
+        let zero = 24_549.835
+        for session in [0.0, 1.0, 35.29, 64.564] {
+            let raw = SWClockAnchorPolicy.sourceSeconds(forSession: session, sessionZeroSeconds: zero)
+            // `SoftwarePlaybackHost` publishes `max(0, raw - zero)`.
+            #expect(abs(max(0, raw - zero) - session) < 1e-9)
+        }
+    }
+
+    @Test("a target that cannot be expressed is passed through rather than made worse")
+    func sourceSecondsRefusesNonsense() {
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 10, sessionZeroSeconds: -5) == 10)
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: 10, sessionZeroSeconds: .nan) == 10)
+        #expect(SWClockAnchorPolicy.sourceSeconds(forSession: .infinity, sessionZeroSeconds: 100).isInfinite)
     }
 }

@@ -5,7 +5,7 @@ import AetherEngine
 
 func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl swdecode: \(url.absoluteString) (maxPackets=\(maxPackets))")
+    print(EngineLog.redacted("aetherctl swdecode: \(url.absoluteString) (maxPackets=\(maxPackets))"))
     print("")
 
     let result: SoftwareDecodeProbeResult
@@ -30,6 +30,9 @@ func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     if let fmt = result.firstFramePixelFormat {
         print("First frame pixfmt:   \(fmt)")
         print("First frame size:     \(result.firstFrameWidth)x\(result.firstFrameHeight)")
+        if let color = result.firstFrameColor {
+            print("First frame color:    \(color)")
+        }
     } else {
         print("First frame:          (none decoded)")
     }
@@ -38,6 +41,22 @@ func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     }
     print("=========================")
     print("")
+
+    // #407: the ladder in decoder OUTPUT order, i.e. presentation order. Ascending and evenly spaced
+    // is healthy; a sawtooth means the pictures and the timestamps are paired wrong, which no packet
+    // counter and no renderer counter can see.
+    let times = result.frameTimesSeconds
+    if times.count >= 2 {
+        let backwards = zip(times, times.dropFirst()).filter { $1 < $0 }.count
+        print("=== FRAME TIMES (presentation order, first \(times.count)) ===")
+        print(times.prefix(12).map { String(format: "%.3f", $0) }.joined(separator: "  "))
+        print("Steps backwards:      \(backwards) of \(times.count - 1)")
+        if backwards > 0 {
+            print("VERDICT: the pictures are paired with the wrong timestamps. The container withheld")
+            print("         its PTS and something invented one from decode order (#407).")
+        }
+        print("")
+    }
 
     // Verdict
     if !result.openSucceeded {

@@ -32,6 +32,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
     private static let hostFacingTypeFiles = [
         "PlayerState.swift",
         "PlaybackErrorInfo.swift",
+        "ProbeControl.swift",
         "PlaybackClock.swift",
         "SeekEvent.swift",
         "StartupProgress.swift",
@@ -51,13 +52,17 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "Diagnostics/EngineDiagnostics.swift",
         "Diagnostics/LiveTelemetry.swift",
         "Diagnostics/EngineLog.swift",
+        "Network/EngineTLS.swift",
         "FrameExtractor/FrameExtractor.swift",
+        "Recording/RecordingState.swift",
     ]
 
     /// Public, and deliberately undocumented as host API. Each entry is a claim that an adopter
     /// reading the docs is better off not meeting this symbol, so it carries its reason.
     private static let notHostAPI: [String: String] = [
         "setForceSoftwarePathForTesting": "test hook, aetherctl live --sw",
+        "setForceAudioPipelineFailureForTesting": "test hook, aetherctl play --drop-audio",
+        "setForceMasterPlaylistForTesting": "test hook, aetherctl live --force-master",
         "setSourceThrottleKbpsForTesting": "test hook, aetherctl --throttle-kbps",
         "setSoftwareBackgroundAudioOnlyForTesting": "test hook",
         "softwareVideoFramesEnqueuedForTesting": "test hook",

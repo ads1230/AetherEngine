@@ -30,11 +30,35 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// ended SHORT of its Content-Length - the observable behind the sequential reader's
         /// EIO-not-EOF distinction (a lost source must not read as end-of-media).
         case serveThenDrop(afterBytes: Int64)
+        /// Audit DMX-5: a 206 that starts `start` rather than where it was asked, the way an edge
+        /// that aligns ranges to its own chunk boundary answers. The body is that range's.
+        case serve206From(start: Int64)
+        /// Audit DMX-101: a server that cannot address bytes. Whatever range was asked for, the
+        /// answer is a 200 with the whole source from byte 0 and its full Content-Length.
+        case serve200
     }
 
     let port: UInt16
-    private let listenFD: Int32
-    private let totalSize: Int64
+    private let listener: LoopbackListener
+    /// #551: a var only so a test can make the origin's stated total CHANGE between two requests,
+    /// which is the one shape that proves the reader rechecks a warm's size against the connection
+    /// that is actually serving it. Every other test leaves it at its init value.
+    private var totalSize: Int64
+    /// #551: answer a finite range with everything from its start to the end of the source, i.e.
+    /// serve WIDER than asked. Non-conforming, and a real shape: an edge that rounds a range up to
+    /// its own chunk boundary does this. Default off keeps every existing test on the historical
+    /// behaviour.
+    private let ignoreRangeEnd: Bool
+    /// AE#619: serve `patternByte(at:)` instead of a constant, so a test can check that the bytes
+    /// the reader returns are the bytes at the offset it claims. Default off keeps every existing
+    /// test on the historical constant body.
+    private let patternedBody: Bool
+
+    /// The byte a `patternedBody` origin serves at `offset`. Varies within every 256-byte run and
+    /// between runs, so a shifted or reordered read cannot match by accident.
+    static func patternByte(at offset: Int64) -> UInt8 {
+        UInt8(truncatingIfNeeded: offset ^ (offset >> 8) ^ (offset >> 16) ^ (offset >> 24))
+    }
     private let chunkBytes: Int
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
@@ -49,6 +73,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private var _requestedRanges: [(start: Int64, end: Int64?)] = []
     private var _requestLog: [(path: String, start: Int64, end: Int64?)] = []
     private var _rangeHeaderPresent: [Bool] = []
+    /// #551 round 2: the headers each request arrived with, lowercased names. A credential that
+    /// must not reach a target is only provably absent at the target.
+    private var _requestHeaders: [[String: String]] = []
     private var _inflight = 0
     private var _peakInflight = 0
     private var _refusedForConcurrency = 0
@@ -65,6 +92,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
     var refusedForConcurrency: Int {
         lock.lock(); defer { lock.unlock() }
         return _refusedForConcurrency
+    }
+
+    /// #551 only: restate the source's size for every request from here on.
+    func setTotalSize(_ size: Int64) {
+        lock.lock(); totalSize = size; lock.unlock()
     }
 
     var bytesWritten: Int64 {
@@ -91,6 +123,12 @@ final class ThrottledOriginServer: @unchecked Sendable {
         return _requestLog
     }
 
+    /// #551 round 2: every request's headers, in `requestLog` order, names lowercased.
+    var requestHeaders: [[String: String]] {
+        lock.lock(); defer { lock.unlock() }
+        return _requestHeaders
+    }
+
     /// Whether each logged request carried a Range header at all. A range-less GET is logged in
     /// `requestLog` as (start 0, end nil), indistinguishable from `bytes=0-`; the sequential-origin
     /// reader's whole contract is that it never sends Range, so its tests assert on THIS.
@@ -110,90 +148,73 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// winning its race in the field. `isSuffix` is true for the `bytes=-n` form.
     init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
           refuseAboveConcurrency: Int? = nil,
+          ignoreRangeEnd: Bool = false,
+          patternedBody: Bool = false,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
           respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
         self.totalSize = totalSize
+        self.ignoreRangeEnd = ignoreRangeEnd
+        self.patternedBody = patternedBody
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
         self.refuseAboveConcurrency = refuseAboveConcurrency
         self.firstByteDelayUs = firstByteDelayUs
         self.respond = respond
 
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var one: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bindResult = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindResult == 0, listen(fd, 4) == 0 else {
-            close(fd)
-            return nil
-        }
-        var bound = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &bound) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(fd, $0, &len)
-            }
-        }
-        guard nameResult == 0 else {
-            close(fd)
-            return nil
-        }
-        self.listenFD = fd
-        self.port = UInt16(bigEndian: bound.sin_port)
-
-        Thread.detachNewThread { [self] in acceptLoop() }
+        // #450: a backlog of 4 is a ceiling of this harness's own, and the suite that reads
+        // this origin's request log is measuring how many concurrent readers get on the link.
+        // A harness that brings its own version of the cause cannot measure it.
+        guard let listener = LoopbackListener(backlog: 32) else { return nil }
+        self.listener = listener
+        self.port = listener.port
+        listener.start { [self] fd in admit(fd) }
     }
 
     func stop() {
         lock.lock()
-        let fds = _connFDs
-        _connFDs = []
         let alreadyStopped = _stopped
         _stopped = true
+        // shutdown unblocks a recv or a write parked on this fd and fails every later one; it
+        // does not free the descriptor number. The serving thread owns that number until it
+        // exits and closes it under this lock (`closeConnection`), so no write of its own can
+        // land on a number the kernel has handed to someone else in between. Closing here did
+        // exactly that on 2026-09-03: a write in `writeFully` hit a recycled guarded fd and
+        // EXC_GUARD took the whole test process with it, 20 tests into 2475.
+        let fds = alreadyStopped ? [] : _connFDs
+        for fd in fds { shutdown(fd, SHUT_RDWR) }
         lock.unlock()
         guard !alreadyStopped else { return }
-        // shutdown unblocks a write parked on a full socket buffer; close alone may not.
-        for fd in fds {
-            shutdown(fd, SHUT_RDWR)
-            close(fd)
-        }
-        shutdown(listenFD, SHUT_RDWR)
-        close(listenFD)
+        listener.stop()
     }
 
-    private func acceptLoop() {
-        while true {
-            let fd = accept(listenFD, nil, nil)
-            if fd < 0 { return }
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            lock.lock()
-            if _stopped {
-                lock.unlock()
-                shutdown(fd, SHUT_RDWR)
-                close(fd)
-                return
-            }
-            _connFDs.append(fd)
+    /// The one place a connection fd is closed. Deregistering and closing under the lock is
+    /// what keeps `stop()` from shutting down a number this thread has already given back.
+    private func closeConnection(_ fd: Int32) {
+        lock.lock()
+        _connFDs.removeAll { $0 == fd }
+        close(fd)
+        lock.unlock()
+    }
+
+    private func admit(_ fd: Int32) -> Bool {
+        lock.lock()
+        if _stopped {
             lock.unlock()
-            Thread.detachNewThread { [self] in serve(fd) }
+            shutdown(fd, SHUT_RDWR)
+            close(fd)
+            return false
         }
+        _connFDs.append(fd)
+        lock.unlock()
+        Thread.detachNewThread { [self] in serve(fd) }
+        return true
     }
 
     /// One connection, many requests: a bounded-range reader issues the next range on the
     /// same socket, so serving exactly one and hanging up would force a new connection per
     /// range and make the pooling measurement meaningless.
     private func serve(_ fd: Int32) {
+        defer { closeConnection(fd) }
         while !stopped {
             if !serveOneRequest(fd) { return }
         }
@@ -234,6 +255,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
         _requestedRanges.append((offset, rangeEnd))
         _requestLog.append((path, offset, rangeEnd))
         _rangeHeaderPresent.append(hadRangeHeader)
+        _requestHeaders.append(Self.parseHeaders(request))
         let requestIndex = _requestLog.count - 1
         // #388: in flight from the moment this origin has a request to answer until its body is
         // written. A request parked in `readRequestHeader` on a kept-alive socket is not one.
@@ -260,9 +282,15 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil
+        var answersWholeSource = false
         switch respond(requestIndex, offset, path) {
         case .serve206:
             break
+        case .serve200:
+            answersWholeSource = true
+            offset = 0
+        case .serve206From(let start):
+            offset = max(0, min(start, totalSize - 1))
         case .serveThenGoSilent(let afterBytes):
             silentAfter = max(0, afterBytes)
         case .serveThenDrop(let afterBytes):
@@ -280,15 +308,8 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 + "Connection: keep-alive\r\n\r\n"
             return writeFully(fd, Array(header.utf8))
         case .dropConnection:
-            // `serve` leaves closing to `stop()`, which closes every fd still in `_connFDs`.
-            // Closing here without deregistering first frees a descriptor number the process
-            // can hand straight to the next socket, and `stop()` would then shut down whatever
-            // took it over. Deregister under the lock, then close exactly once.
-            lock.lock()
-            _connFDs.removeAll { $0 == fd }
-            lock.unlock()
+            // Returning false ends `serve`, which closes the fd exactly once.
             shutdown(fd, SHUT_RDWR)
-            close(fd)
             return false
         }
 
@@ -299,15 +320,19 @@ final class ThrottledOriginServer: @unchecked Sendable {
             pendingDelay -= slice
         }
 
-        let last = rangeEnd ?? (totalSize - 1)
+        let last = answersWholeSource ? totalSize - 1 : (ignoreRangeEnd ? nil : rangeEnd) ?? (totalSize - 1)
         let remaining = last - offset + 1
         // Keep-alive, not close: a bounded range that tears the socket down would make every
         // refill a fresh connection and would hide exactly the pooling question under test.
-        let header = "HTTP/1.1 206 Partial Content\r\n"
-            + "Content-Range: bytes \(offset)-\(last)/\(totalSize)\r\n"
-            + "Content-Length: \(remaining)\r\n"
-            + "Accept-Ranges: bytes\r\n"
-            + "Connection: keep-alive\r\n\r\n"
+        let header = answersWholeSource
+            ? "HTTP/1.1 200 OK\r\n"
+                + "Content-Length: \(remaining)\r\n"
+                + "Connection: keep-alive\r\n\r\n"
+            : "HTTP/1.1 206 Partial Content\r\n"
+                + "Content-Range: bytes \(offset)-\(last)/\(totalSize)\r\n"
+                + "Content-Length: \(remaining)\r\n"
+                + "Accept-Ranges: bytes\r\n"
+                + "Connection: keep-alive\r\n\r\n"
         guard writeFully(fd, Array(header.utf8)) else { return false }
 
         let chunk = [UInt8](repeating: 0x55, count: chunkBytes)
@@ -328,20 +353,36 @@ final class ThrottledOriginServer: @unchecked Sendable {
             // the peer has not handed to its application yet. The bytes this origin says it served
             // would silently stop being the bytes the reader can see, and a test asserting on the
             // amount delivered would be measuring the machine's scheduling (the 2026-08-11 CI
-            // failure: 327212 of 2 MiB arrived). FIN keeps the sent bytes deliverable; `stop()`
-            // closes the descriptor, which is why it stays registered in `_connFDs`.
+            // failure: 327212 of 2 MiB arrived). FIN keeps the sent bytes deliverable, so this
+            // thread parks on the half-closed socket until `stop()` and closes it only then.
             if let dropAfter, served >= dropAfter {
                 shutdown(fd, SHUT_WR)
+                while !stopped { usleep(200_000) }
                 return false
             }
             var n = Int(min(Int64(chunkBytes), remaining - served))
             if let silentAfter { n = Int(min(Int64(n), silentAfter - served)) }
             if let dropAfter { n = Int(min(Int64(n), dropAfter - served)) }
-            guard writeBody(fd, Array(chunk[0..<n])) else { return false }
+            let body = patternedBody
+                ? (0..<n).map { Self.patternByte(at: offset + served + Int64($0)) }
+                : Array(chunk[0..<n])
+            guard writeBody(fd, body) else { return false }
             served += Int64(n)
             if throttleUs > 0 { usleep(throttleUs) }
         }
         return true
+    }
+
+    private static func parseHeaders(_ request: String) -> [String: String] {
+        var headers: [String: String] = [:]
+        for line in request.components(separatedBy: "\r\n").dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { continue }
+            headers[name] = value
+        }
+        return headers
     }
 
     private func readRequestHeader(_ fd: Int32) -> String? {

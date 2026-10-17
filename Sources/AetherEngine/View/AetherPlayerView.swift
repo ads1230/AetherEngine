@@ -27,20 +27,16 @@ import SwiftUI
 /// can also change across sessions when consecutive sources dispatch to
 /// different paths.
 @MainActor
-public final class AetherPlayerView: PlatformBaseView {
+public final class AetherPlayerView: PlatformBaseView, HeldStillSurface {
 
     private var hostedLayer: CALayer?
+    /// AE#711 follow-up: the picture held over an in-place item swap, above `hostedLayer`.
+    private let presenter = HeldStillPresenter()
+    private var stillLayer: CALayer? { presenter.layer }
 
-    #if canImport(AppKit)
-    /// Hosts the video layer as a sublayer of its backing layer. Note on
-    /// macOS PiP (probe suite 2026-08-29): PIPAgent MIRRORS the layer 1:1
-    /// wherever it lives — the arrangement does not affect PiP, and the
-    /// "subview of NSHostingController.view" runtime warning is AVKit
-    /// inserting its stand-in at the window's root regardless of nesting
-    /// (benign; not preventable app-side). Sizing for PiP is the pre-size
-    /// contract (`pipOverrideSize`).
-    private let layerHostView = NSView()
-    #endif
+    /// Engine-internal. The engine this view was last bound to, so a dismantling surface can unbind
+    /// from it synchronously and a second engine binding the view can take it over (AE#536).
+    weak var bindingEngine: AetherEngine?
 
     #if canImport(UIKit)
     public override init(frame: CGRect) {
@@ -70,11 +66,6 @@ public final class AetherPlayerView: PlatformBaseView {
         #elseif canImport(AppKit)
         wantsLayer = true
         layer?.backgroundColor = CGColor.black
-        layerHostView.wantsLayer = true
-        layerHostView.layer?.backgroundColor = CGColor.black
-        layerHostView.frame = bounds
-        layerHostView.autoresizingMask = [.width, .height]
-        addSubview(layerHostView)
         #endif
     }
 
@@ -93,60 +84,73 @@ public final class AetherPlayerView: PlatformBaseView {
     #endif
 
     private func applyLayerFrame() {
-        guard let hosted = hostedLayer else { return }
+        guard hostedLayer != nil || stillLayer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        #if canImport(AppKit)
-        layerHostView.frame = bounds
-        hosted.frame = layerHostView.bounds
-        #else
-        hosted.frame = bounds
-        #endif
+        hostedLayer?.frame = bounds
+        presenter.layout(bounds)
         CATransaction.commit()
     }
-
 
     // MARK: - Engine-only attachment
 
     /// Engine-internal. Replace whichever layer is currently hosted with
     /// `layer`. Synchronous, runs on the main actor, no implicit
     /// animations so swaps don't flash. Idempotent if the same layer is
-    /// already attached.
+    /// already attached. A previously hosted layer is removed only while it
+    /// still sits in this view: a layer an engine has since presented on
+    /// another surface is not pulled back out of it (AE#536).
     func attach(_ layer: CALayer) {
         if hostedLayer === layer { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        hostedLayer?.removeFromSuperlayer()
+        if let hosted = hostedLayer, hosted.superlayer === self.layer {
+            hosted.removeFromSuperlayer()
+        }
         #if canImport(UIKit)
-        self.layer.addSublayer(layer)
-        layer.frame = bounds
+        if let still = stillLayer { self.layer.insertSublayer(layer, below: still) } else { self.layer.addSublayer(layer) }
         #elseif canImport(AppKit)
-        // Plain sublayer of layerHostView. macOS PiP never touches the layer
-        // at all — PIPAgent MIRRORS it 1:1 wherever it lives, with the
-        // mapping captured at startPictureInPicture (probe suite 2026-08-29:
-        // sublayer / backing-layer / fully-detached arrangements behave
-        // identically) — so the arrangement is chosen for simplicity, and
-        // sizing for PiP is the pre-size contract (see pipOverrideSize and
-        // AetherEngine.prepareMacPiPStart).
-        layerHostView.frame = bounds
-        layerHostView.wantsLayer = true
-        layerHostView.layer?.addSublayer(layer)
-        layer.frame = layerHostView.bounds
+        if let still = stillLayer { self.layer?.insertSublayer(layer, below: still) } else { self.layer?.addSublayer(layer) }
+        // Resize the video layer in lockstep with the view's bounds during a
+        // live window drag. Without this it only catches up on the next layout()
+        // pass, and because an NSView's layer is anchored bottom-left that lag
+        // reads as the image sliding off-center while resizing. Starting at full
+        // bounds with both axes flexible keeps it full-bounds throughout.
+        layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         #endif
+        layer.frame = bounds
         hostedLayer = layer
         CATransaction.commit()
     }
 
     /// Engine-internal. Remove the current hosted layer without
-    /// replacement (used on unbind / teardown).
+    /// replacement (used on unbind / teardown). Same ownership rule as
+    /// `attach`: a layer that has moved to another surface stays there.
     func detach() {
+        clearStill()
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        hosted.removeFromSuperlayer()
+        if hosted.superlayer === self.layer {
+            hosted.removeFromSuperlayer()
+        }
         hostedLayer = nil
         CATransaction.commit()
     }
+
+    // MARK: - Held picture
+
+    /// Engine-internal. Lays `frame` over the hosted layer until `clearStill()`, see `HeldStillPresenter`.
+    @discardableResult
+    func showStill(_ frame: CVPixelBuffer, gravity: AVLayerVideoGravity, isHDR: Bool) -> Bool {
+        let host: CALayer? = layer
+        return presenter.show(frame, gravity: gravity, isHDR: isHDR, on: host, bounds: bounds)
+    }
+
+    /// Engine-internal. Removes the held picture, if any. Idempotent.
+    func clearStill() { presenter.clear() }
+
+    var isHoldingStill: Bool { presenter.layer != nil }
 }
 
 // MARK: - Platform base view alias
@@ -189,10 +193,13 @@ public struct AetherPlayerSurface: UIViewRepresentable {
     }
 
     public static func dismantleUIView(_ uiView: AetherPlayerView, coordinator: ()) {
-        // The engine releases its weak ref when the view deinits, but
-        // explicit unbind keeps the layer removed promptly on teardown.
-        Task { @MainActor in
-            uiView.detach()
+        // AE#536: unbind now, not in a later Task. A surface remounted by identity
+        // is dismantled after the incoming one was bound, and SwiftUI may have
+        // rebound the outgoing view on its way out; unbinding it here hands the
+        // layer back to the incoming view at once. Identity-guarded, so it never
+        // detaches a successor.
+        MainActor.assumeIsolated {
+            uiView.bindingEngine?.unbind(view: uiView)
         }
     }
 }
@@ -217,8 +224,10 @@ public struct AetherPlayerSurface: NSViewRepresentable {
     }
 
     public static func dismantleNSView(_ nsView: AetherPlayerView, coordinator: ()) {
-        Task { @MainActor in
-            nsView.detach()
+        // AE#536: unbind synchronously so the layer moves to a surface bound
+        // after this one instead of waiting for the next session.
+        MainActor.assumeIsolated {
+            nsView.bindingEngine?.unbind(view: nsView)
         }
     }
 }
