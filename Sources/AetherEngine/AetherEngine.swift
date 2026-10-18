@@ -907,8 +907,11 @@ public final class AetherEngine: ObservableObject {
             #endif
             // Bridge AVKit's layer re-host with display-immediately frames;
             // the synchronizer clock stalls during the re-host (see
-            // SampleBufferRenderer.beginPiPHandoffWindow).
-            if pictureInPictureActive && !oldValue {
+            // SampleBufferRenderer.beginPiPHandoffWindow). BOTH edges: the
+            // stop re-hosts the layer back into the app and stalls the clock
+            // the same way — visible as a flicker on the return-arrow (field
+            // 2026-10-18); the start-side bridge alone left it unbridged.
+            if pictureInPictureActive != oldValue {
                 softwareHost?.beginPiPHandoffWindow()
             }
             #if os(tvOS)
