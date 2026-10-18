@@ -201,6 +201,43 @@ extension AetherEngine {
         format != .sdr
     }
 
+    /// Lays the current software picture over the layer for `seconds` around a PiP return.
+    ///
+    /// On iOS the sample-buffer layer is never reparented for PiP: it stays in the host view and
+    /// renders the system's "playing in picture in picture" stand-in itself while the window is up.
+    /// On the return-arrow that stand-in flashes back over the live picture ~400 ms after didStop
+    /// (frame analysis 2026-10-18; nothing of ours is in the hierarchy at that point). The host calls
+    /// this at the restore request and again at didStop; the still covers the tile through the
+    /// flash window and a timer releases it. Native/external routes have nothing to cover.
+    public func holdPictureForPictureInPictureReturn(seconds: Double) {
+        let surface: (any HeldStillSurface)? = boundStillView ?? boundView
+        guard let view = surface, let host = softwareHost else {
+            EngineLog.emit("[AetherEngine] PiP-return hold: skipped (no software host or surface)", category: .engine)
+            return
+        }
+        guard let frame = host.displayedFrame() else {
+            EngineLog.emit("[AetherEngine] PiP-return hold: skipped (no frame)", category: .engine)
+            return
+        }
+        releaseHeldPicture(reason: nil)
+        guard view.showStill(frame, gravity: videoGravity, isHDR: Self.heldPictureIsHDR(videoFormat)) else {
+            EngineLog.emit("[AetherEngine] PiP-return hold: frame could not be wrapped for display", category: .engine)
+            return
+        }
+        heldPictureView = view
+        heldPictureLastRoute = "software renderer (PiP return)"
+        heldPictureShownAt = .now
+        heldPictureAwaitsSoftwareHost = false
+        heldPictureToken &+= 1
+        let token = heldPictureToken
+        EngineLog.emit("[AetherEngine] held picture: up for PiP return (\(Int(seconds * 1000))ms)", category: .engine)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard let self, self.heldPictureToken == token, self.heldPictureView != nil else { return }
+            self.releaseHeldPicture(reason: "PiP return settled")
+        }
+    }
+
     /// Takes the held picture down. `reason` nil is a silent clear (nothing was up, or a new hold
     /// replaces it); every other release is logged with how long the picture stood.
     func releaseHeldPicture(reason: String?) {
