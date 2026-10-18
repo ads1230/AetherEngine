@@ -1906,6 +1906,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     category: .session
                 )
             }
+            resolveUnlabelledTrueHDAtmos(
+                audioStream: audioStream, audioDemuxer: audioDem, streamIndex: audioStreamIndex)
             let compat = AudioCodecCompat.from(codecID)
             // HE-AAC needs bridging only when there is no ASC (live ADTS/MPEG-TS): synthesized ASC
             // would declare LC at the SBR output rate, decoded as garbage by AudioToolbox (-11821).
@@ -2635,6 +2637,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     var audioBridgeLiveBytes: Int { subsystemSnapshot().audioBridge?.liveBytes.totalBytes ?? 0 }
     var audioBridgeOutputBytesLifetime: Int64 { subsystemSnapshot().audioBridge?.outputBytesLifetime ?? 0 }
+    var objectAudioActivity: ObjectAudioActivity? { subsystemSnapshot().audioBridge?.objectAudioActivity }
     var lastAVGapMs: Double { subsystemSnapshot().producer?.lastAVGapMs ?? 0 }
 
     public func diagnosticStats() -> DiagnosticStats {
