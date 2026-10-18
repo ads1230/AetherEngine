@@ -238,6 +238,29 @@ extension AetherEngine {
         }
     }
 
+    /// Like `holdPictureForPictureInPictureReturn`, but the cover is a LIVE mirror: every 40 ms the
+    /// renderer's currently displayed frame replaces the held picture, so the tile reads as continuous
+    /// video while the sample-buffer layer underneath goes through AVKit's return choreography
+    /// (system stand-in during the landing, a one-frame blank ~0.5 s after it — frame analysis
+    /// 2026-10-18). A frozen still over the same window read as a freeze. The mirror lags the layer
+    /// by at most one tick; when the layer has nothing to show the last mirrored frame stays.
+    public func holdLivePictureForPictureInPictureReturn(seconds: Double) {
+        holdPictureForPictureInPictureReturn(seconds: seconds)
+        guard heldPictureView != nil, let host = softwareHost else { return }
+        let token = heldPictureToken
+        var lastFrame: CVPixelBuffer? = nil
+        Task { @MainActor [weak self] in
+            while let self, self.heldPictureToken == token, let view = self.heldPictureView {
+                try? await Task.sleep(for: .milliseconds(40))
+                guard self.heldPictureToken == token, self.heldPictureView === view else { return }
+                if let frame = host.displayedFrame(), frame !== lastFrame {
+                    lastFrame = frame
+                    _ = view.updateStill(frame)
+                }
+            }
+        }
+    }
+
     /// Takes the held picture down. `reason` nil is a silent clear (nothing was up, or a new hold
     /// replaces it); every other release is logged with how long the picture stood.
     func releaseHeldPicture(reason: String?) {

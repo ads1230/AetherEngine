@@ -9,6 +9,8 @@ import AVFoundation
 protocol HeldStillSurface: AnyObject {
     /// `gravity` is the engine's; a surface that takes its fill from the host ignores it.
     func showStill(_ frame: CVPixelBuffer, gravity: AVLayerVideoGravity, isHDR: Bool) -> Bool
+    /// Replaces the held picture in place; false when nothing is held or the frame cannot be wrapped.
+    func updateStill(_ frame: CVPixelBuffer) -> Bool
     func clearStill()
     var isHoldingStill: Bool { get }
 }
@@ -41,6 +43,15 @@ final class HeldStillPresenter {
         still.sampleBufferRenderer.enqueue(sample)
         layer = still
         CATransaction.commit()
+        return true
+    }
+
+    /// Replaces the shown picture in place (the live mirror around a PiP return). No flush: on
+    /// iOS 18+/26 the renderer's flush clears the displayed image, and a display-immediately
+    /// sample simply supersedes the one on screen.
+    func update(_ frame: CVPixelBuffer) -> Bool {
+        guard let still = layer, let sample = Self.sample(frame) else { return false }
+        still.sampleBufferRenderer.enqueue(sample)
         return true
     }
 

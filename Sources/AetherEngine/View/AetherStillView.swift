@@ -62,6 +62,8 @@ public final class AetherStillView: PlatformBaseView, HeldStillSurface {
         return presenter.show(frame, gravity: videoGravity, isHDR: isHDR, on: host, bounds: bounds)
     }
 
+    func updateStill(_ frame: CVPixelBuffer) -> Bool { presenter.update(frame) }
+
     func clearStill() { presenter.clear() }
 
     var isHoldingStill: Bool { presenter.layer != nil }

@@ -147,6 +147,8 @@ public final class AetherPlayerView: PlatformBaseView, HeldStillSurface {
         return presenter.show(frame, gravity: gravity, isHDR: isHDR, on: host, bounds: bounds)
     }
 
+    func updateStill(_ frame: CVPixelBuffer) -> Bool { presenter.update(frame) }
+
     /// Engine-internal. Removes the held picture, if any. Idempotent.
     func clearStill() { presenter.clear() }
 
