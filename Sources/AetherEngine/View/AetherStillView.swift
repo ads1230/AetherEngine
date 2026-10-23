@@ -63,8 +63,14 @@ public final class AetherStillView: PlatformBaseView, HeldStillSurface {
     }
 
     func updateStill(_ frame: CVPixelBuffer) -> Bool { presenter.update(frame) }
+    func showCompositorStill(file: URL, pastFirstFrameBy offset: Double, gravity: AVLayerVideoGravity,
+                             budgetSeconds: Double) async -> Bool {
+        let host: CALayer? = layer
+        return await presenter.show(file: file, pastFirstFrameBy: offset, gravity: videoGravity,
+                                    on: host, bounds: bounds, budgetSeconds: budgetSeconds)
+    }
 
     func clearStill() { presenter.clear() }
 
-    var isHoldingStill: Bool { presenter.layer != nil }
+    var isHoldingStill: Bool { presenter.isShowing }
 }

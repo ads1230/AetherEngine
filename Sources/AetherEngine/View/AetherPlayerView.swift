@@ -32,7 +32,7 @@ public final class AetherPlayerView: PlatformBaseView, HeldStillSurface {
     private var hostedLayer: CALayer?
     /// AE#711 follow-up: the picture held over an in-place item swap, above `hostedLayer`.
     private let presenter = HeldStillPresenter()
-    private var stillLayer: CALayer? { presenter.layer }
+    private var stillLayer: CALayer? { presenter.layer ?? presenter.playerLayer }
 
     /// Engine-internal. The engine this view was last bound to, so a dismantling surface can unbind
     /// from it synchronously and a second engine binding the view can take it over (AE#536).
@@ -148,11 +148,17 @@ public final class AetherPlayerView: PlatformBaseView, HeldStillSurface {
     }
 
     func updateStill(_ frame: CVPixelBuffer) -> Bool { presenter.update(frame) }
+    func showCompositorStill(file: URL, pastFirstFrameBy offset: Double, gravity: AVLayerVideoGravity,
+                             budgetSeconds: Double) async -> Bool {
+        let host: CALayer? = layer
+        return await presenter.show(file: file, pastFirstFrameBy: offset, gravity: gravity,
+                                    on: host, bounds: bounds, budgetSeconds: budgetSeconds)
+    }
 
     /// Engine-internal. Removes the held picture, if any. Idempotent.
     func clearStill() { presenter.clear() }
 
-    var isHoldingStill: Bool { presenter.layer != nil }
+    var isHoldingStill: Bool { presenter.isShowing }
 }
 
 // MARK: - Platform base view alias
