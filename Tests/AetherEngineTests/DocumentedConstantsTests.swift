@@ -18,6 +18,13 @@ import AetherLibavcodec
 /// Adding a number to the docs? Pin it here in the same commit.
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
+    func testDemuxNSErrorCaseCodesMatchDocumentation() throws {
+        XCTAssertEqual((DemuxerError.openFailed(code: -1) as NSError).code, 0)
+        XCTAssertEqual((DemuxerError.streamInfoFailed(code: -1) as NSError).code, 1)
+        XCTAssertEqual((DemuxerError.readFailed(code: -1) as NSError).code, 2)
+        assertDocumented("0 (open), 1 (stream information), and 2 (read)", try documentation())
+    }
+
     func testLiveReplayQuarantineBoundsMatchDocumentation() throws {
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingBytes, 96 * 1_024 * 1_024)
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingPackets, 10_000)
@@ -37,6 +44,21 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("**two concurrent diagnostic reads**", docs)
         assertDocumented("**one pending retirement\nread**", docs)
         assertDocumented("five entries per item", docs)
+    }
+
+    func testNominalRateCompositionShiftMatchesDocumentation() throws {
+        XCTAssertEqual(H264CompositionOffsetRepair.maximumNominalShiftPictures, 16)
+        assertDocumented("clamped to **16 pictures**", try documentation())
+    }
+
+    func testCompositionSampleExtensionMatchesDocumentation() throws {
+        XCTAssertEqual(H264CompositionOffsetRepair.extendedSampleTarget, 48)
+        assertDocumented("up to\n**48 pictures**", try documentation())
+    }
+
+    func testLandingEnvelopeHoldMatchesDocumentation() throws {
+        XCTAssertEqual(H264CompositionOffsetRepair.landingEnvelopePictures, 8)
+        assertDocumented("first **8 pictures**", try documentation())
     }
 
     func testPartialCompositionHoldBoundsMatchDocumentation() throws {
@@ -82,7 +104,27 @@ final class DocumentedConstantsTests: XCTestCase {
                        0.036, accuracy: 1e-9)
 
         assertDocumented("once K = 3 newer base-layer", fel)
-        assertDocumented("is the maximum layer skew, 3;", fel)
+        assertDocumented("(`maxLayerSkewFrames`) is the maximum layer", fel)
+        assertDocumented("skew, 3, and is the whole rule", fel)
+
+        // The deadline release (§5.5) and its log lines (§5.11).
+        XCTAssertEqual(DualLayerVideoDecoder.deadlineMarginFloor, 0.1)
+        XCTAssertEqual(DualLayerVideoDecoder.enhancementGraceFloor, 0.015)
+        XCTAssertEqual(DualLayerVideoDecoder.enhancementGraceCap, 0.05)
+        XCTAssertEqual(DualLayerVideoDecoder.heldClockWallBound, 2)
+        XCTAssertEqual(DualLayerVideoDecoder.maxDeadlineHoldFrames, 7)
+        XCTAssertEqual(DoviFelComposer.maxFramesInFlight + DualLayerVideoDecoder.maxLayerSkewFrames + 2, 8)
+        XCTAssertEqual(DualLayerVideoDecoder.minSweepDelay, 0.002)
+        XCTAssertEqual(DualLayerVideoDecoder.maxSweepDelay, 0.25)
+        XCTAssertEqual(DualLayerVideoDecoder.totalsLogIntervalSeconds, 10)
+        assertDocumented("least 100 ms.", fel)
+        assertDocumented("clamped to 15 to 50 ms", fel)
+        assertDocumented("it waits 2 s at most", fel)
+        assertDocumented("`maxDeadlineHoldFrames` = 7 newer arrivals", fel)
+        assertDocumented("`maxFramesInFlight + maxLayerSkew + 2` = 8 pending frames", fel)
+        assertDocumented("every 2 to 250 ms", fel)
+        assertDocumented("at most every 10 s", fel)
+        assertDocumented("`maxDeadlineHoldFrames` = 7 with a render clock", fel)
         assertDocumented("waiting enhancement frames capped at 10", fel)
         assertDocumented("At most 10 enhancement frames wait", fel)
         assertDocumented("fixed capacity 32", fel)

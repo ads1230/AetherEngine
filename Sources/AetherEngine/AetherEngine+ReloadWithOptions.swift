@@ -135,6 +135,18 @@ extension AetherEngine {
             throw AetherEngineError.sessionNotReloadable(refusal)
         }
 
+        // #846: same shape as the dual-layer route above. Only the on flip is refused; the rebuild honours off.
+        if let refusal = SessionOptionCorrection.upscaleRouteRefusal(
+            isCustomSource: isCustomSource, current: loadedOptions, proposed: proposed
+        ) {
+            EngineLog.emit(
+                "[AetherEngine] upscalesLowResolutionVideo correction refused, \(refusal.rawValue): a custom "
+                + "source keeps the route it was loaded with; load() it again with the new option",
+                category: .engine
+            )
+            throw AetherEngineError.sessionNotReloadable(refusal)
+        }
+
         // Stating the no-op matters for the same reason #364's teletext switch states it: a host
         // that corrected an option and saw a plain reload cannot otherwise tell "the correction was
         // already in force" from "the correction did not arrive".
@@ -271,6 +283,11 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
     /// rebuild does not re-run, so the change could not take effect. Call `load()` again with the
     /// new option. URL sources are not affected: their correction re-runs `load()`.
     case dualLayerRouteNeedsFreshLoad
+    /// #846: a correction that turns `upscalesLowResolutionVideo` on for a session that plays from a custom
+    /// `IOReader` source. The route is decided by `load()`, which a custom source's in-place rebuild does
+    /// not re-run, so the change could not take effect. Call `load()` again with the new option. Turning
+    /// it off is honoured in place, and URL sources are not affected: their correction re-runs `load()`.
+    case upscaleRouteNeedsFreshLoad
 
     public var description: String {
         switch self {
@@ -282,6 +299,8 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
             return "this live source's audio is delivered separately and merged on the native path only"
         case .dualLayerRouteNeedsFreshLoad:
             return "the dual-layer Dolby Vision route of a custom source is decided by load(), not by a rebuild"
+        case .upscaleRouteNeedsFreshLoad:
+            return "the low-resolution upscale route of a custom source is decided by load(), not by a rebuild"
         }
     }
 }
@@ -294,9 +313,9 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
 /// deciding which half it belongs in.
 enum SessionOptionCorrection {
 
-    /// The fields that NAME the session rather than tune it. Each opens the source on a different
-    /// pipeline, and the engine writes the last two itself, so a host write races its determination.
+    /// The fields that NAME the session rather than tune it: source pipeline and diagnostic identity.
     static let loadIdentityFields: [String] = [
+        "sourceDiagnosticsContext",
         "isLive",
         "audioOnly",
         "nativeRemoteHLS",
@@ -333,6 +352,10 @@ enum SessionOptionCorrection {
     /// torn down, so it does not ride on reflection.
     static func refusedFields(from current: LoadOptions, to proposed: LoadOptions) -> [String] {
         var refused: [String] = []
+        // Internal reopens retain the load's request identity; a new identity needs a new load.
+        if proposed.sourceDiagnosticsContext != current.sourceDiagnosticsContext {
+            refused.append("sourceDiagnosticsContext")
+        }
         if proposed.isLive != current.isLive { refused.append("isLive") }
         if proposed.audioOnly != current.audioOnly { refused.append("audioOnly") }
         if proposed.nativeRemoteHLS != current.nativeRemoteHLS { refused.append("nativeRemoteHLS") }
@@ -381,10 +404,15 @@ enum SessionOptionCorrection {
         // for exactly that shape), so this is the demuxed-audio population rather than a superset of
         // it. `load`'s own guard re-checks that the main container carries no audio; erring towards
         // the refusal here is the safe direction, because the session it leaves alone is playing.
-        if isLive, hasCompanionAudioReader {
+        if isDemuxedAudioLive(isLive: isLive, hasCompanionAudioReader: hasCompanionAudioReader) {
             return .demuxedAudioLiveIsNativeOnly
         }
         return nil
+    }
+
+    /// A live source whose audio arrives through a companion reader, which only the native path merges.
+    static func isDemuxedAudioLive(isLive: Bool, hasCompanionAudioReader: Bool) -> Bool {
+        isLive && hasCompanionAudioReader
     }
 
     /// Why a `preferDualLayerDolbyVision` or `dolbyVisionHandling` correction cannot be honoured, or nil
@@ -412,6 +440,17 @@ enum SessionOptionCorrection {
             && proposed.preferDualLayerDolbyVision
         guard preferenceChanged || handlingMovesRoute else { return nil }
         return .dualLayerRouteNeedsFreshLoad
+    }
+
+    /// Why a correction of `upscalesLowResolutionVideo` cannot be honoured, or nil when it can (#846). A
+    /// custom source's rebuild keeps the session's route, so only turning the option ON is refused there;
+    /// turning it off is honoured, because the next host simply gets no plan.
+    static func upscaleRouteRefusal(
+        isCustomSource: Bool, current: LoadOptions, proposed: LoadOptions
+    ) -> SessionReloadRefusal? {
+        guard isCustomSource, !current.upscalesLowResolutionVideo, proposed.upscalesLowResolutionVideo
+        else { return nil }
+        return .upscaleRouteNeedsFreshLoad
     }
 
     /// Every field the proposal changed, for the log line. Reflection is right here and wrong
@@ -443,10 +482,11 @@ enum SessionOptionCorrection {
     /// right for a tuning lever and wrong for an identity one, so the choice has to be made
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
+        "sourceDiagnosticsContext",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "upscalesLowResolutionVideo", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
-        "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
+        "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",
         "softwareDVRRetention",
         "liveBlockingReload", "liveJoinProfile", "preferSoftwareVideoRoute", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately",
@@ -454,8 +494,8 @@ enum SessionOptionCorrection {
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
-        "audioDelaySeconds", "teletextPage", "inverseTelecine", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
+        "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
+        "audioDelaySeconds", "audioShaping", "teletextPage", "inverseTelecine", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }

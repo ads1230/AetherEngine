@@ -225,4 +225,144 @@ struct VideoPrerollTests {
         #expect(output.synchronizer.rate == 0)
         try await waitFor { output.synchronizer.rate == 1 }
     }
+
+    @Test("An explicit pause cancels a hold and refuses a stale positive seek or rebuffer release",
+          .timeLimit(.minutes(1)), arguments: [false, true])
+    func explicitPauseOwnsTheClock(gateReady: Bool) {
+        let output = AudioOutput()
+        defer { output.stop() }
+        let transitions = Transitions()
+        output.onPrerollTransition = { transitions.append($0) }
+        output.videoPrerollSatisfied = { _ in false }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        #expect(output.prerollPending)
+        output.setPlaybackEnabled(false)
+        output.videoPrerollSatisfied = { _ in gateReady }
+        output.seekClock(to: CMTime(seconds: 9, preferredTimescale: 90000), rate: 1)
+        output.setRate(1.5)
+        #expect(output.rate == 0)
+        #expect(output.currentTimeSeconds == 9, "a paused seek still moves its anchor")
+        #expect(!output.prerollPending)
+        #expect(transitions.events == [.began, .released(.cancelled)])
+    }
+
+    @Test("Explicit play after a paused seek restores the normal preroll", .timeLimit(.minutes(1)))
+    func explicitPlayRestoresPreroll() async throws {
+        let output = AudioOutput()
+        defer { output.stop() }
+        let gate = Gate()
+        output.videoPrerollSatisfied = { _ in gate.isOpen }
+        output.setPlaybackEnabled(false)
+        output.seekClock(to: CMTime(seconds: 9, preferredTimescale: 90000), rate: 1)
+        output.setPlaybackEnabled(true)
+        #expect(output.rate == 0, "enabling transport alone does not start an unanchored clock")
+        output.setRate(1.5)
+        #expect(output.prerollPending)
+        gate.set(true)
+        try await waitFor { output.rate == 1.5 }
+        #expect(!output.prerollPending)
+    }
+
+    @Test("Stopping a paused output retires its epoch without resetting the clock", .timeLimit(.minutes(1)))
+    func stoppedPausedOutputKeepsItsAnchor() {
+        let output = AudioOutput()
+        output.seekClock(to: CMTime(seconds: 42, preferredTimescale: 90000), rate: 0)
+        let epoch = output.epoch
+        output.stop()
+        #expect(output.epoch != epoch)
+        #expect(output.currentTimeSeconds == 42)
+        output.setRate(1)
+        #expect(output.rate == 0, "a retired output cannot be restarted by late work")
+    }
+
+    // MARK: - Decoder progress (#800)
+
+    @Test("A hold waits on while the decoder produces frames, up to the cap")
+    func progressExtendsTheTimeout() {
+        #expect(AudioOutput.prerollKeepsWaiting(waited: 1.9, sinceProgress: 1.9))
+        #expect(!AudioOutput.prerollKeepsWaiting(waited: 2.0, sinceProgress: 2.0), "no progress: the plain timeout")
+        #expect(AudioOutput.prerollKeepsWaiting(waited: 3.5, sinceProgress: 0.1), "4K AV1 still decoding up to the target")
+        #expect(!AudioOutput.prerollKeepsWaiting(waited: 3.5, sinceProgress: 2.0), "the decoder stopped")
+        #expect(!AudioOutput.prerollKeepsWaiting(waited: AudioOutput.prerollProgressCap, sinceProgress: 0))
+    }
+
+    /// A frame counter the test advances by hand.
+    private final class Progress: Sendable {
+        private let count = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+        func tick() { count.withLock { $0 &+= 1 } }
+        var value: UInt64 { count.withLock { $0 } }
+    }
+
+    /// Every hold transition `AudioOutput` reports.
+    private final class Transitions: Sendable {
+        private let list = OSAllocatedUnfairLock<[AudioOutput.PrerollTransition]>(initialState: [])
+        func append(_ transition: AudioOutput.PrerollTransition) { list.withLock { $0.append(transition) } }
+        var events: [ClockHoldEvent] { list.withLock { $0.map(\.event) } }
+        var generations: [Int] { list.withLock { $0.map(\.generation) } }
+    }
+
+    @Test("A decoder still producing frames holds the clock past the plain timeout", .timeLimit(.minutes(1)))
+    func decoderProgressHoldsPastTheTimeout() async throws {
+        let output = AudioOutput()
+        let progress = Progress()
+        // Both run in the hold's own poll, off the cooperative pool: a loop of `Task.sleep` ticks
+        // starved past `prerollTimeout` on CI's one-thread pool and read as a decoder that stopped.
+        let opensAt = CACurrentMediaTime() + AudioOutput.prerollTimeout + 0.5
+        output.videoPrerollSatisfied = { _ in CACurrentMediaTime() >= opensAt }
+        output.videoPrerollProgress = { progress.tick(); return progress.value }
+        let transitions = Transitions()
+        output.onPrerollTransition = { transitions.append($0) }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        // The release is reported right after the start, so waiting on the rate can read between them.
+        try await waitFor { transitions.events.count == 2 }
+        #expect(output.synchronizer.rate == 1)
+        guard case .released(.ready(let waited))? = transitions.events.last else {
+            Issue.record("expected a ready release, got \(transitions.events)")
+            return
+        }
+        #expect(waited > AudioOutput.prerollTimeout)
+        #expect(transitions.events.first == .began)
+    }
+
+    @Test("A hold reports its start and a timed-out release", .timeLimit(.minutes(1)))
+    func reportsATimedOutHold() async throws {
+        let output = AudioOutput()
+        let transitions = Transitions()
+        output.videoPrerollSatisfied = { _ in false }
+        output.onPrerollTransition = { transitions.append($0) }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        #expect(transitions.events == [.began])
+        try await waitFor { transitions.events.count == 2 }
+        #expect(output.synchronizer.rate == 1)
+        guard transitions.events.count == 2, case .released(.timedOut)? = transitions.events.last else {
+            Issue.record("expected began then timedOut, got \(transitions.events)")
+            return
+        }
+    }
+
+    @Test("A newer seek and a pause release a waiting hold as cancelled", .timeLimit(.minutes(1)))
+    func cancelledHoldsAreReported() {
+        let output = AudioOutput()
+        let transitions = Transitions()
+        output.videoPrerollSatisfied = { _ in false }
+        output.onPrerollTransition = { transitions.append($0) }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        output.seekClock(to: CMTime(seconds: 9, preferredTimescale: 90000), rate: 1)
+        output.pause()
+        output.pause()
+        #expect(transitions.events == [.began, .released(.cancelled), .began, .released(.cancelled)])
+        let gens = transitions.generations
+        #expect(gens.count == 4 && gens[0] == gens[1] && gens[2] == gens[3] && gens[2] > gens[0])
+    }
+
+    @Test("A start whose frames are already queued does not report a hold", .timeLimit(.minutes(1)))
+    func readyStartIsNoHold() {
+        let output = AudioOutput()
+        let transitions = Transitions()
+        output.videoPrerollSatisfied = { _ in true }
+        output.onPrerollTransition = { transitions.append($0) }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        output.stop()
+        #expect(transitions.events.isEmpty)
+    }
 }
