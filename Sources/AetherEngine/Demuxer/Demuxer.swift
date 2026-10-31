@@ -408,6 +408,114 @@ public final class Demuxer: @unchecked Sendable {
     // Forward-only custom sources report false.
     var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
 
+    /// Where the data really ends when the container's header states a longer duration. A download or
+    /// remux cut short keeps its full-length header (a Matroska Segment whose declared size, SeekHead
+    /// Cues offset and Duration all describe the file that was meant to be written), so `duration` reads
+    /// twice the media that exists and a segment plan built on it advertises boundaries past the last
+    /// byte; the player then waits forever on a segment nothing can produce (field 2026-10-31: a
+    /// Jellyfin episode declaring 1281.9 s whose data ended at 554.0 s). Set from
+    /// `measureSourceEndSeconds` by the session that measured it; `duration` then reports the shorter
+    /// of the two so every plan, scrubber and end-of-media rule describes the bytes that exist.
+    var measuredSourceEndSeconds: Double?
+
+    /// Total byte size of the source as libavformat sees it: the provider's resolved length for a
+    /// network or disc source, `avio_size` for a local file. nil until/unless known.
+    var sourceByteSize: Int64? {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        if let provided = avioProvider?.resolvedByteSize { return provided > 0 ? provided : nil }
+        guard let ctx = formatContext, let pb = ctx.pointee.pb else { return nil }
+        let size = avio_size(pb)
+        return size > 0 ? size : nil
+    }
+
+    /// Default tail window `measureSourceEndSeconds` reads: enough for the last cluster of anything up
+    /// to a high-bitrate UHD remux (one 4 s GOP at 40 Mbit/s is 20 MB, but its last packets are what
+    /// matter and they sit in the final 2 MB).
+    static let sourceEndProbeTailBytes: Int64 = 2 * 1024 * 1024
+
+    /// Reads the source's final bytes to find where its media really ends, in seconds on the stream
+    /// axis: the latest packet end (`pts` or `dts`, plus the packet's own duration) across every
+    /// delivered stream, from a byte seek `tailBytes` before the end to EOF. Costs one ranged read of
+    /// the tail; the cursor is left at EOF for the caller's own repositioning. nil when the size is
+    /// unknown, the source cannot be byte-positioned, no packet surfaced in the window (the tail is all
+    /// index, tags or attachments), the deadline fired, or the read ended in an error rather than EOF,
+    /// any of which leaves the header's duration standing.
+    func measureSourceEndSeconds(tailBytes: Int64 = Demuxer.sourceEndProbeTailBytes,
+                                 timeout: TimeInterval = 4.0) -> Double? {
+        guard let size = sourceByteSize, size > 0, isSourceSeekable else { return nil }
+        avioProvider?.beginReadDeadline(secondsFromNow: timeout)
+        defer { avioProvider?.endReadDeadline() }
+        guard byteSeek(to: Swift.max(0, size - tailBytes)) else { return nil }
+        let deadline = Date().addingTimeInterval(timeout)
+        var latestEnd: Double?
+        var packetsRead = 0
+        var reachedEOF = false
+        // Backstop against a tail that is nothing but tiny packets; the byte window is the real bound.
+        let readBudget = 200_000
+        while packetsRead < readBudget, Date() < deadline {
+            let read: UnsafeMutablePointer<AVPacket>?
+            do {
+                read = try readPacket()
+            } catch {
+                break  // a read error is not the end of the data
+            }
+            guard let pkt = read else {
+                reachedEOF = true
+                break
+            }
+            var packet: UnsafeMutablePointer<AVPacket>? = pkt
+            defer { trackedPacketFree(&packet) }
+            packetsRead += 1
+            if let end = packetEndSeconds(pkt), end > (latestEnd ?? -Double.infinity) {
+                latestEnd = end
+            }
+        }
+        // The read left the context at EOF; the next reposition starts clean.
+        accessLock.lock()
+        if let ctx = formatContext { clearIOFlagsAfterSeekLocked(ctx) }
+        accessLock.unlock()
+        guard reachedEOF, packetsRead > 0, avioProvider?.readDeadlineFired != true else { return nil }
+        return latestEnd
+    }
+
+    /// `pts` (or `dts` without one) plus the packet's duration, in seconds of its stream's time base.
+    private func packetEndSeconds(_ pkt: UnsafeMutablePointer<AVPacket>) -> Double? {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext,
+              pkt.pointee.stream_index >= 0,
+              pkt.pointee.stream_index < Int32(ctx.pointee.nb_streams),
+              let st = ctx.pointee.streams[Int(pkt.pointee.stream_index)]
+        else { return nil }
+        let stamp = pkt.pointee.pts != Int64.min ? pkt.pointee.pts : pkt.pointee.dts
+        guard stamp != Int64.min else { return nil }
+        let tb = st.pointee.time_base
+        guard tb.num > 0, tb.den > 0 else { return nil }
+        let ticks = pkt.pointee.duration > 0 ? stamp &+ pkt.pointee.duration : stamp
+        return Double(ticks) * Double(tb.num) / Double(tb.den)
+    }
+
+    /// The duration the engine reports once a source's real end has been measured: the shorter of the
+    /// header's statement and the measured end. A measurement at or past the declaration changes
+    /// nothing (the header was right); only a positive, shorter one replaces it.
+    static func durationApplyingMeasuredSourceEnd(_ resolved: Double, measuredEnd: Double?) -> Double {
+        guard let measuredEnd, measuredEnd.isFinite, measuredEnd > 0, measuredEnd < resolved else { return resolved }
+        return measuredEnd
+    }
+
+    /// A seek is a new intent at a new position; an I/O verdict libavformat latched at the old one must
+    /// not outlive it. `pb->error` is sticky: once a read has failed, `avio_read` answers every later
+    /// read with the same error without asking the source, so one refused fetch (the Matroska Cues a
+    /// truncated file's SeekHead places past its last byte, visited by the first seek) killed the
+    /// whole session with "read failed (Operation not permitted)". `avio_seek` clears only
+    /// `eof_reached`. Mirrors `resetAfterTimeSeek`. Caller holds `accessLock`.
+    private func clearIOFlagsAfterSeekLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        guard let pb = ctx.pointee.pb else { return }
+        pb.pointee.eof_reached = 0
+        pb.pointee.error = 0
+    }
+
     /// True when the source is a UHD Blu-ray clip whose Dolby Vision RPUs are folded in from the enhancement-layer
     /// PID (`BluRayDolbyVisionLayers`): the video packets carry the RPU but not the enhancement layer itself.
     private(set) var foldsBluRayDolbyVisionLayers = false
@@ -1529,12 +1637,14 @@ public final class Demuxer: @unchecked Sendable {
             let dur = ctx.pointee.duration
             return dur > 0 ? Double(dur) / Double(AV_TIME_BASE) : 0
         }()
-        // Declared (sequential-origin caller trust) > custom reader > disc MPLS/IFO (AE#105) > container.
-        return Self.effectiveDurationSeconds(
+        // Declared (sequential-origin caller trust) > custom reader > disc MPLS/IFO (AE#105) > container,
+        // then capped at the measured end of a truncated source (`measuredSourceEndSeconds`).
+        let resolved = Self.effectiveDurationSeconds(
             declared: openProfile.declaredDurationSeconds,
             readerDuration: (avioProvider as? CustomIOReaderBridge)?.timeSeekableReader?.mediaDuration,
             discTitle: selectedDiscTitleDurationSeconds,
             container: container)
+        return Self.durationApplyingMeasuredSourceEnd(resolved, measuredEnd: measuredSourceEndSeconds)
     }
 
     /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by
@@ -2587,6 +2697,7 @@ public final class Demuxer: @unchecked Sendable {
             #endif
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
+        clearIOFlagsAfterSeekLocked(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         return ret >= 0
@@ -2652,6 +2763,7 @@ public final class Demuxer: @unchecked Sendable {
             )
         }
         avformat_flush(ctx)
+        clearIOFlagsAfterSeekLocked(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1
         return ret >= 0
@@ -2822,6 +2934,7 @@ public final class Demuxer: @unchecked Sendable {
         }
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
+        clearIOFlagsAfterSeekLocked(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         // matroska may return success with a partial index after abort; deadline flag
@@ -3109,6 +3222,7 @@ public final class Demuxer: @unchecked Sendable {
         dropPeekedPacketsLocked()
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)
         avformat_flush(ctx)
+        clearIOFlagsAfterSeekLocked(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         return ret >= 0

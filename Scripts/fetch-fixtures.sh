@@ -21,6 +21,7 @@
 #   cue-axis-bframes.mkv/.mp4     - one HEVC B-pyramid stream in both containers (AE#561)
 #   long-first-gop-{aac,pcm}.mkv  - 11 s first GOP, then 2 s GOPs; passthrough and bridged audio
 #   bridge-eac3-51.mkv            - 5.1 PCM in MKV, drives the EAC3 audio bridge (AE#561 follow-up)
+#   truncated-header-duration.mkv - 30 s MKV cut at 60 % of its bytes; header still declares 30 s
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
 # own library. Drop those into ./Fixtures/user/ (also gitignored)
@@ -385,6 +386,21 @@ for AUDIO in aac pcm; do
         -g 1000 -sc_threshold 0 -force_key_frames "0,11,13,15,17,19,21,23,25,27,29" \
         -c:a "$CODEC" -ac 2 -f matroska "$FIXTURES_DIR/long-first-gop-$AUDIO.mkv"
 done
+
+# Truncated source (TruncatedSourcePlanTests): a complete 30 s MKV whose bytes are cut at 60 %. The
+# Segment size, the SeekHead's Cues offset and the Duration all still describe the full file, so the
+# demuxer reads 30 s from the header while the data ends near 18 s.
+echo "→ truncated-header-duration.mkv (30 s declared, bytes cut at 60 %)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=320x180:rate=24" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 30 \
+    -c:v libx264 -preset veryfast -pix_fmt yuv420p -b:v 200k -g 48 \
+    -c:a aac -ac 2 -f matroska "$FIXTURES_DIR/truncated-header-duration.full.mkv"
+FULL_BYTES=$(stat -f %z "$FIXTURES_DIR/truncated-header-duration.full.mkv" 2>/dev/null \
+    || stat -c %s "$FIXTURES_DIR/truncated-header-duration.full.mkv")
+head -c $((FULL_BYTES * 6 / 10)) "$FIXTURES_DIR/truncated-header-duration.full.mkv" \
+    > "$FIXTURES_DIR/truncated-header-duration.mkv"
+rm -f "$FIXTURES_DIR/truncated-header-duration.full.mkv"
 
 echo ""
 echo "Done. Try:"

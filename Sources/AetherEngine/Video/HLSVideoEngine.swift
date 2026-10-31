@@ -1484,7 +1484,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // encoder-side reorder artifact rather than an origin, so it clamps to 0.
         let formatStart = dem.formatStartTime
         sourceStartSeconds = formatStart == Int64.min ? 0 : max(0, Double(formatStart) / Double(AV_TIME_BASE))
-        let durationSeconds = dem.duration
+        var durationSeconds = dem.duration
         var plan: [Segment]
         var keyframeBytePositions: [Int64: Int64] = [:]
         planKeyframeAdvanceTicks = 0
@@ -1545,13 +1545,76 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // 3. Build the segment plan. Uses the same cut algorithm as libavformat's hls muxer
             //    (first IDR at-or-after `(segIdx+1) * hls_time`); falls back to uniform stride
             //    if the index has < 2 entries (restart machinery handles any plan/muxer drift).
-            let keyframeEntries = dem.indexedKeyframeEntries(streamIndex: videoIndex)
-            let keyframes = keyframeEntries.map(\.pts)
-            let indexTrustworthy = Self.keyframeIndexIsTrustworthy(
+            var keyframeEntries = dem.indexedKeyframeEntries(streamIndex: videoIndex)
+            var keyframes = keyframeEntries.map(\.pts)
+            var indexTrustworthy = Self.keyframeIndexIsTrustworthy(
                 keyframes: keyframes,
                 videoTimeBase: videoTimeBase,
                 sourceDurationSeconds: durationSeconds
             )
+
+            // 2b. Truncated source: a file cut short keeps its full-length header, so the duration
+            //     above describes media that does not exist and a plan built on it advertises
+            //     segments past the last byte; AVPlayer then waits on one forever (field 2026-10-31:
+            //     a Jellyfin MKV declaring 1281.9 s whose data ended at 554.0 s sat on -12889 at the
+            //     cut). Measure where the data really ends and plan to that instead. Only where the
+            //     header, not the tail, is what libavformat read the duration from, and only when
+            //     the index already looks wrong (untrustworthy, or pointing past the end), so a
+            //     healthy file pays nothing. See HLSVideoEngine+TruncatedSource.swift.
+            let sourceByteSize = dem.sourceByteSize
+            let indexPastEnd = Self.indexClaimsBytesPastEnd(
+                positions: keyframeEntries.map(\.pos), fileSize: sourceByteSize)
+            let videoTbSeconds = Double(videoTimeBase.num) / Double(videoTimeBase.den)
+            let indexStopsShort = videoTbSeconds > 0 && Self.indexStopsShortOfDeclaredEnd(
+                keyframeSeconds: keyframes.map { Double($0) * videoTbSeconds },
+                declaredDuration: durationSeconds)
+            if Self.shouldMeasureSourceEnd(
+                headerDeclaresDuration: Self.containerDurationIsHeaderDeclared(formatName: dem.containerFormatName),
+                indexTrustworthy: indexTrustworthy,
+                indexClaimsBytesPastEnd: indexPastEnd,
+                indexStopsShort: indexStopsShort,
+                hasSegmentedReader: dem.timeSeekableReader != nil,
+                isSourceSeekable: dem.isSourceSeekable,
+                isDiscSource: dem.isDiscSource,
+                sequentialOrigin: sequentialOriginPinsProducerToZero
+            ) {
+                let probeStart = DispatchTime.now()
+                let measuredEnd = dem.measureSourceEndSeconds(timeout: Self.sourceEndProbeTimeout)
+                let probeMs = Double(DispatchTime.now().uptimeNanoseconds - probeStart.uptimeNanoseconds) / 1_000_000
+                if let measuredEnd, Self.sourceIsTruncated(declaredDuration: durationSeconds, measuredEnd: measuredEnd) {
+                    let declared = durationSeconds
+                    dem.measuredSourceEndSeconds = measuredEnd
+                    durationSeconds = dem.duration
+                    if let sourceByteSize {
+                        keyframeEntries.removeAll { $0.pos >= sourceByteSize }
+                    }
+                    keyframes = keyframeEntries.map(\.pts)
+                    indexTrustworthy = Self.keyframeIndexIsTrustworthy(
+                        keyframes: keyframes,
+                        videoTimeBase: videoTimeBase,
+                        sourceDurationSeconds: durationSeconds
+                    )
+                    EngineLog.emit(
+                        "[HLSVideoEngine] truncated source: the container declares "
+                        + "\(String(format: "%.3f", declared))s but its data ends at "
+                        + "\(String(format: "%.3f", measuredEnd))s"
+                        + (sourceByteSize.map { " (\($0) bytes on the wire)" } ?? "")
+                        + (indexPastEnd ? "; index entries pointed past the end" : "")
+                        + (indexStopsShort ? "; the index stopped short of the declared end" : "")
+                        + "; planning and reporting \(String(format: "%.3f", durationSeconds))s "
+                        + "(probe \(String(format: "%.0f", probeMs))ms)",
+                        category: .session
+                    )
+                } else {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] truncated-source probe: data ends at "
+                        + (measuredEnd.map { String(format: "%.3f", $0) + "s" } ?? "an unmeasured point")
+                        + " against a declared \(String(format: "%.3f", durationSeconds))s; the "
+                        + "declaration stands (probe \(String(format: "%.0f", probeMs))ms)",
+                        category: .session
+                    )
+                }
+            }
             // AE#268: a segmented source declares its own random-access points. Prefer them over both
             // builders below: the index is sparse on MPEG-TS, and the uniform grid advertises
             // boundaries no keyframe sits on (a 4 s grid over a 10 s GOP is producible on one boundary
