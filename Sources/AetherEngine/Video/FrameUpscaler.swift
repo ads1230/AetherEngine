@@ -14,7 +14,7 @@ import VideoToolbox
 /// size); failures and any further overrun disable it for good, each logged once. A MetalFX overrun is
 /// remembered for the process (`MetalFXCostMemory`), so a later stage at least as heavy and as fast starts
 /// without MetalFX.
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 final class FrameUpscaler: @unchecked Sendable {
 
     struct Stats: Equatable, Sendable {
@@ -466,14 +466,14 @@ enum MetalFXCostMemory {
     }
 }
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 extension FrameUpscaler {
     static func resetMetalFXCostMemoryForTesting() { MetalFXCostMemory.reset() }
 }
 
 // MARK: - GPU state shared across rebuilds
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private struct UpscaleError: Error, CustomStringConvertible {
     let description: String
     let underlying: Error?
@@ -484,7 +484,7 @@ private struct UpscaleError: Error, CustomStringConvertible {
 }
 
 /// The colour kernels, compiled once per process and device rather than per stage.
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 final class UpscaleKernels: @unchecked Sendable {
     let toRGBA: MTLComputePipelineState
     let toNV12: MTLComputePipelineState
@@ -511,7 +511,7 @@ final class UpscaleKernels: @unchecked Sendable {
     }
 }
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private final class GPU {
     let device: MTLDevice
     let queue: MTLCommandQueue
@@ -558,7 +558,7 @@ private final class GPU {
 
 // MARK: - One plan's processing chain
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private final class Stage {
     private(set) var plan: UpscalePlan
     private let gpu: GPU
@@ -758,7 +758,7 @@ private final class Stage {
 
 // MARK: - VT low-latency super resolution
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private final class MLScaler {
     let outputWidth: Int
     let outputHeight: Int
@@ -858,7 +858,7 @@ private final class MLScaler {
 let mlBorderClamp = 12
 
 /// Replicates row/column `luma` (and `luma / 2` in chroma) over the outer band on all four sides.
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private func clampBorder(_ buffer: CVPixelBuffer, luma k: Int) throws {
     CVPixelBufferLockBaseAddress(buffer, [])
     defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
@@ -895,7 +895,7 @@ private struct UncheckedSendable<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private final class Completion: @unchecked Sendable {
     private let semaphore = DispatchSemaphore(value: 0)
     private let lock = NSLock()
@@ -927,7 +927,7 @@ private final class Completion: @unchecked Sendable {
     }
 }
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private final class AbandonedPasses: @unchecked Sendable {
     private let lock = NSLock()
     private var nextID = 0
@@ -942,7 +942,7 @@ private final class AbandonedPasses: @unchecked Sendable {
     func remove(_ id: Int) { lock.lock(); buffers[id] = nil; lock.unlock() }
 }
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private struct MLTimeout: Error, CustomStringConvertible {
     let seconds: Double
     let outstanding: Int
@@ -951,12 +951,12 @@ private struct MLTimeout: Error, CustomStringConvertible {
 
 // MARK: - Buffers
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private func makePool(width: Int, height: Int, format: OSType) throws -> CVPixelBufferPool {
     try makePool(attributes: [kCVPixelBufferPixelFormatTypeKey as String: format], width: width, height: height)
 }
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private func makePool(attributes: [String: Any], width: Int, height: Int) throws -> CVPixelBufferPool {
     var attrs = attributes
     attrs[kCVPixelBufferWidthKey as String] = width
@@ -973,7 +973,7 @@ private func makePool(attributes: [String: Any], width: Int, height: Int) throws
     return pool
 }
 
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private func pooledBuffer(_ pool: CVPixelBufferPool) throws -> CVPixelBuffer {
     var buffer: CVPixelBuffer?
     let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
@@ -982,7 +982,7 @@ private func pooledBuffer(_ pool: CVPixelBufferPool) throws -> CVPixelBuffer {
 }
 
 /// Plane-by-plane copy of `dst`'s size from `src` at `origin` (even), 8-bit bi-planar; the values carry over as is.
-@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+@available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *)
 private func copyPlanes(from src: CVPixelBuffer, to dst: CVPixelBuffer, origin: (x: Int, y: Int) = (0, 0)) throws {
     guard origin.x % 2 == 0, origin.y % 2 == 0,
           CVPixelBufferGetWidth(src) >= origin.x + CVPixelBufferGetWidth(dst),

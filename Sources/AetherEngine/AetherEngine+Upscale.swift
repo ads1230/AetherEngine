@@ -34,7 +34,7 @@ extension AetherEngine {
         var osSupportsStage = false
         var metalFXSupported = false
         var mlScaleFactors: (Int, Int) -> [Float] = { _, _ in [] }
-        if #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) {
+        if #available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *) {
             osSupportsStage = true
             // The stage is not built for the simulator, which therefore counts as a device without it.
             #if !targetEnvironment(simulator)
@@ -57,7 +57,7 @@ extension AetherEngine {
     /// A disable is latched for the session (`sourceUpscaleDisabled`), so no later host builds the stage again.
     func wireUpscaleStatus(from host: SoftwarePlaybackHost) {
         #if !targetEnvironment(simulator)
-        guard #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *),
+        guard #available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *),
               let upscaler = host.frameUpscaler as? FrameUpscaler, let plan = host.upscalePlan else { return }
         // Weak both ways: the host owns the stage, which owns this handler.
         upscaler.onEvent = { [weak self, weak host] event in

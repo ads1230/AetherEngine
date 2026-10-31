@@ -1273,7 +1273,7 @@ final class SoftwarePlaybackHost {
         frameUpscaler = nil
         guard let plan = upscalePlan, !Self.isDualLayer(decoder) else { return handler }
         #if !targetEnvironment(simulator)
-        if #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) {
+        if #available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *) {
             let interval = frameRate.flatMap { $0.isFinite && $0 > 0 ? 1 / $0 : nil } ?? 1.0 / 25
             guard let stage = FrameUpscaler(plan: plan, frameInterval: interval) else { return handler }
             frameUpscaler = stage
