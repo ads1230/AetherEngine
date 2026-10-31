@@ -322,7 +322,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
     var wantsMoreDecodedFrames: Bool {
         // Tests pin the layer's readiness to drive the demux loop's back-pressure park; the cushion
         // defers to that pin so upstream's host tests exercise the same park on the fork.
+        #if DEBUG
         if let answer = readyForMoreMediaDataForTesting { return answer() }
+        #endif
         reorderLock.lock()
         defer { reorderLock.unlock() }
         return reorderBuffer.count < cushionTargetFrames
