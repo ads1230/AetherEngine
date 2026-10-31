@@ -1560,7 +1560,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             //     cut). Measure where the data really ends and plan to that instead. Only where the
             //     header, not the tail, is what libavformat read the duration from, and only when
             //     the index already looks wrong (untrustworthy, or pointing past the end), so a
-            //     healthy file pays nothing. See HLSVideoEngine+TruncatedSource.swift.
+            //     healthy file pays nothing. Helpers: the truncated-source section of
+            //     HLSVideoEngine+SegmentPlanning.swift (kept in an existing file so a consumer's
+            //     package graph needs no re-resolve to see them).
             let sourceByteSize = dem.sourceByteSize
             let indexPastEnd = Self.indexClaimsBytesPastEnd(
                 positions: keyframeEntries.map(\.pos), fileSize: sourceByteSize)
