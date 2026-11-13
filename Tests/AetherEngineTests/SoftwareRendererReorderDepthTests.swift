@@ -50,7 +50,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func inOrderInputHoldsOneFrame() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(forHardwareDecoder: false))
         let handed = Handed()
         renderer.setFrameEnqueuedObserver { handed.append($0) }
@@ -69,7 +69,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func defaultDepthStillSortsABPyramid() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         // Decode order I0 P4 B2 b1 b3, two pyramids.
         let handed = feed(renderer, [0, 160, 80, 40, 120, 320, 240, 200, 280])
         #expect(handed.seconds == [0, 40, 80, 120, 160, 200, 240, 280, 320].map { Double($0) / 1000 })
@@ -80,7 +80,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func hardwareDepthSortsAThreeDeepPyramid() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(forHardwareDecoder: true))
         // Decode order: I0 P4 B2 b1 b3, each gap one frame.
         let handed = feed(renderer, [0, 4, 2, 1, 3, 8, 6, 5, 7].map { $0 * 40 })
@@ -92,7 +92,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func depthOneSortsASingleInversion() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(1)
         let handed = feed(renderer, [30, 10, 20])
         #expect(handed.seconds == [0.010, 0.020, 0.030])
@@ -103,7 +103,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func outOfOrderFrameIsDroppedAndDepthRises() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(1)
         let handed = Handed()
         renderer.setFrameEnqueuedObserver { handed.append($0) }
@@ -128,7 +128,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func guardAppliesAtTheHardwareDepthToo() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         let handed = Handed()
         renderer.setFrameEnqueuedObserver { handed.append($0) }
         let pixels = Self.makePixelBuffer()
@@ -168,7 +168,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func guardCoversAFrameInFlight() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(1)
         let handed = Handed()
         let second = SecondEnqueuer(pixels: Self.makePixelBuffer(), trigger: 0.040, lateTicks: 20)
@@ -193,7 +193,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func flushDuringHandoverDoesNotPoisonTheGuard() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(1)
         let handed = Handed()
         let pixels = Self.makePixelBuffer()
@@ -214,7 +214,7 @@ struct SoftwareRendererReorderDepthTests {
     @MainActor
     func flushResetsTheGuard() {
         let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(1)
         let pixels = Self.makePixelBuffer()
         for t in [5000, 5040, 5080] { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(t)) }
@@ -234,7 +234,7 @@ struct SoftwareRendererReorderDepthTests {
 
         func steadyStateHeld(depth: Int) -> Int {
             let renderer = SampleBufferRenderer()
-        renderer.queueReadinessOverrideForTesting = true   // fork cushion: hand over as if the layer were ready
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
             renderer.setReorderDepth(depth)
             let small = Self.makePixelBuffer()
             for i in 0..<12 { renderer.enqueue(pixelBuffer: small, pts: Self.time(i * 40)) }

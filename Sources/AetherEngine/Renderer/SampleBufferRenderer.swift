@@ -207,7 +207,14 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// clock run from the audio there. On the arrival-order path only the frontier counts, the newest
     /// timestamp with every earlier slot handed over, so a frame that came early past a gap does not
     /// open the gate.
+    ///
+    /// A full layer opens it too: nothing more can be handed over until the clock drains the layer,
+    /// so waiting only runs out `AudioOutput.prerollTimeout`. That is the resume after a rebuffer, whose
+    /// frames sit at or behind the stopped clock (AE#1025 follow-up: 2 s of standstill after every
+    /// rebuffer). A start or a seek begins with a flushed layer, which is not full.
     func prerollSatisfied(clock: Double, live: Bool) -> Bool? {
+        // Read outside `reorderLock`: the queue target answers it under its own locks.
+        let layerFull = !isReadyForMoreMediaData
         reorderLock.lock()
         defer { reorderLock.unlock() }
         guard clock.isFinite else { return nil }
@@ -215,6 +222,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         if rate == nil, live { return nil }
         let handed = arrivalFloor != nil ? arrivalFloor?.frontier : _lastReleasedPtsSeconds
         guard let handed else { return false }
+        if layerFull { return true }
         guard let rate else { return handed - clock >= Self.videoPrerollSeconds }
         return handed + 1 / rate - clock >= Self.felPrerollSeconds(frameRate: rate)
     }
@@ -298,6 +306,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private let cushionMinTargetFrames = 12
     #endif
     private let cushionMaxTargetFrames = 128
+    /// Longest stretch of media the cushion holds, whatever the frame size (see `wantsMoreDecodedFrames`).
+    static let cushionMaxSpanSeconds: Double = 1.0
     private let cushionMaxCapFrames = 160
     /// Data size of the most recent decoded frame (row-padding included), read
     /// under reorderLock; 0 until the first frame sets the real scale.
@@ -327,7 +337,18 @@ final class SampleBufferRenderer: @unchecked Sendable {
         #endif
         reorderLock.lock()
         defer { reorderLock.unlock() }
-        return reorderBuffer.count < cushionTargetFrames
+        guard reorderBuffer.count < cushionTargetFrames else { return false }
+        // The byte budget sizes the cushion for HD (12-24 frames); on small pictures it would admit
+        // up to 128 frames, several seconds of decoded video, and the interleaved audio would be fed
+        // just as far ahead — `.ended` then arrived seconds before the queued tail had played
+        // (measured 27.9 s on a 32 s source against upstream's 31.3 s). The cushion is a ~1 s FIFO by
+        // design, so a time span caps it too; the buffer is kept sorted, so its ends are its span.
+        if let oldest = reorderBuffer.first?.1, let newest = reorderBuffer.last?.1,
+           oldest.isNumeric, newest.isNumeric,
+           CMTimeGetSeconds(newest) - CMTimeGetSeconds(oldest) >= Self.cushionMaxSpanSeconds {
+            return false
+        }
+        return true
     }
 
     /// Release cushioned frames to the layer while it will take them, always
@@ -429,6 +450,16 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func setVideoSampleTap(_ tap: (@Sendable (CMSampleBuffer) -> Void)?) {
         reorderLock.lock()
         _videoSampleTap = tap
+        reorderLock.unlock()
+    }
+
+    /// The host's own hook on the same moment, kept apart from the public #311 observer: the source
+    /// timestamp of every frame the queue target accepted, whether it left the reorder buffer on its own
+    /// or in a drain. Same locking as the observer.
+    private var _handoverHook: (@Sendable (Double) -> Void)?
+    func setHandoverHook(_ hook: (@Sendable (Double) -> Void)?) {
+        reorderLock.lock()
+        _handoverHook = hook
         reorderLock.unlock()
     }
 
@@ -857,14 +888,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
     }
 
-    #if DEBUG
     /// Fork: the cushion pump hands frames to the layer only while the queue target reports ready,
-    /// which a headless test renderer never does. Tests that assert hand-over latency set this.
-    var queueReadinessOverrideForTesting: Bool?
-    #endif
+    /// which a headless test renderer never does; tests pin `readyForMoreMediaDataForTesting`.
     private var queueTargetReady: Bool {
         #if DEBUG
-        if let override = queueReadinessOverrideForTesting { return override }
+        if let answer = readyForMoreMediaDataForTesting { return answer() }
         #endif
         return queueTarget.isReadyForMoreMediaData
     }
@@ -1085,7 +1113,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     /// AE#711 follow-up: the newest frame handed to the layer, before the subtitle compositor, for a
     /// rebuild to hold when the layer cannot say what it is showing (off screen, or before tvOS 17.4's
-    /// readback has anything). At most one buffer, released by `flush`.
+    /// readback has anything). At most one buffer, released by a `flush` that clears the picture: one
+    /// that keeps it (seek, recovery) leaves this frame on screen, so it stays the frame to hold.
     private var _lastEnqueuedFrame: CVPixelBuffer?
     var lastEnqueuedFrame: CVPixelBuffer? {
         reorderLock.lock(); defer { reorderLock.unlock() }
@@ -1119,7 +1148,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.lock()
         reorderBuffer.removeAll()
         _pendingPresentation.removeAll()
-        _lastEnqueuedFrame = nil
+        if removingDisplayedImage { _lastEnqueuedFrame = nil }
         // #407: the next frame handed over will not follow the last one, so the gap between them is
         // not a cadence measurement. Left standing, every seek would report one enormous interval.
         _lastHandedPtsSeconds = nil
@@ -1264,9 +1293,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let observer = _frameEnqueuedObserver
         let generation = _flushGeneration
         let sampleTap = _videoSampleTap
+        let handoverHook = accepted ? _handoverHook : nil
         reorderLock.unlock()
         observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
         sampleTap?(sampleBuffer)
+        if let handoverHook, pts.isNumeric { handoverHook(CMTimeGetSeconds(pts)) }
 
         reorderLock.lock()
         enqueueCount += 1
