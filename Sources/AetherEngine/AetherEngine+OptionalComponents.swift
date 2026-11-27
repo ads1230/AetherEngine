@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 extension AetherEngine {
 
@@ -58,6 +59,23 @@ extension AetherEngine {
                 return false
                 #endif
             }
+        }
+
+        /// Host switch over a built-in `dolbyVisionStillReshaping` (reDiffusion fork). Off, the engine
+        /// treats a Dolby Vision Profile 5 / 10.0 source the way a build without the trait does: no
+        /// reshaped stills, scrub previews and the held picture through the system compositor. On by
+        /// default. A session reads it when it opens, so set it before `load`.
+        public static var dolbyVisionStillReshapingEnabled: Bool {
+            get { stillReshapingSwitch.withLock { $0 } }
+            set { stillReshapingSwitch.withLock { $0 = newValue } }
+        }
+
+        private static let stillReshapingSwitch = OSAllocatedUnfairLock(initialState: true)
+
+        /// Whether Dolby Vision Profile 5 / 10.0 frames become reshaped stills: built in and not
+        /// switched off by the host.
+        static var reshapesDolbyVisionStills: Bool {
+            dolbyVisionStillReshaping.isBuiltIn && dolbyVisionStillReshapingEnabled
         }
     }
 }

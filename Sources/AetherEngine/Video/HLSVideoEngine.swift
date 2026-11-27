@@ -2668,7 +2668,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         previewNeedsCompositor = !stillsAvailable
         if !stillsAvailable {
             EngineLog.emit("[HLSVideoEngine] Dolby Vision Profile 5 / 10.0 stills are not built in "
-                           + "(DolbyVisionStillReshaping trait off): no scrub thumbnails or I-frame stills; "
+                           + "(DolbyVisionStillReshaping trait off, or switched off by the host): no scrub thumbnails or I-frame stills; "
                            + "scrub previews and the held picture go through the system compositor", category: .session)
         }
         // AE#682: decided before the routing below, because an I-frame rendition is one of the

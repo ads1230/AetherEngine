@@ -57,7 +57,7 @@ extension AetherEngine {
 
         if let host = nativeSource,
            Self.heldPictureNeedsReshaping(videoFormat: videoFormat, dolbyVisionProfile: sourceDVProfile),
-           !OptionalComponent.dolbyVisionStillReshaping.isBuiltIn {
+           !OptionalComponent.reshapesDolbyVisionStills {
             await holdThroughCompositor(host: host, view: view, generation: generation, started: started)
             return
         }

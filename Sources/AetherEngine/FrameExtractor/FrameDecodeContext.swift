@@ -94,9 +94,13 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 
     /// Whether a source's frames can become a still in this build. A Dolby Vision Profile 5 / 10.0
-    /// frame needs `DolbyVisionStillConverter`, which only the `DolbyVisionStillReshaping` trait compiles.
-    static func yieldsStill(dolbyVisionNoBaseLayer: Bool) -> Bool {
-        !dolbyVisionNoBaseLayer || AetherEngine.OptionalComponent.dolbyVisionStillReshaping.isBuiltIn
+    /// frame needs `DolbyVisionStillConverter`, which only the `DolbyVisionStillReshaping` trait compiles
+    /// and a host can switch off (`OptionalComponent.dolbyVisionStillReshapingEnabled`).
+    static func yieldsStill(
+        dolbyVisionNoBaseLayer: Bool,
+        reshapesStills: Bool = AetherEngine.OptionalComponent.reshapesDolbyVisionStills
+    ) -> Bool {
+        !dolbyVisionNoBaseLayer || reshapesStills
     }
 
     /// Whether this open may ask VideoToolbox. A no-base-layer Dolby Vision title stays on software

@@ -13,6 +13,18 @@ import AetherLibavutil
 @Suite("Optional components fall back when their trait is off")
 struct OptionalComponentFallbackTests {
 
+    /// The switch itself is process-wide and other suites decode Profile 5 stills in parallel, so
+    /// this pins the verdict it feeds instead of flipping it.
+    @Test("a host that switches the still reshaping off gets the answer of a build without the trait")
+    func stillReshapingSwitchedOffYieldsNoStill() {
+        #expect(AetherEngine.OptionalComponent.dolbyVisionStillReshapingEnabled)
+        #expect(AetherEngine.OptionalComponent.reshapesDolbyVisionStills
+                == AetherEngine.OptionalComponent.dolbyVisionStillReshaping.isBuiltIn)
+        #expect(!FrameDecodeContext.yieldsStill(dolbyVisionNoBaseLayer: true, reshapesStills: false))
+        #expect(FrameDecodeContext.yieldsStill(dolbyVisionNoBaseLayer: true, reshapesStills: true))
+        #expect(FrameDecodeContext.yieldsStill(dolbyVisionNoBaseLayer: false, reshapesStills: false))
+    }
+
     @Test("the runtime query reports each component as this build was compiled")
     func runtimeQueryMatchesTheBuild() {
         #expect(AetherEngine.OptionalComponent.allCases.map(\.traitName)
